@@ -1,0 +1,262 @@
+syntax = "proto3";
+package ipc;
+import "google/protobuf/timestamp.proto";
+
+message RepoSource {
+  string src = 1;
+  string password = 2;
+}
+
+message PointSource {
+  string src = 1;
+}
+
+message VfsPoint {
+  string name = 1;
+  uint64 max_bytes = 2;
+  bool can_write = 3;
+  oneof src {
+    PointSource data = 4;
+    RepoSource repo = 5;
+  }
+}
+
+message VfsUser {
+  string name = 1;
+  string password_hash = 2;
+  repeated string keys = 3;
+  repeated VfsPoint points = 4;
+}
+
+enum Priority {
+  Debug = 0;
+  Info = 1;
+  Warning = 2;
+  Error = 3;
+  Critical = 4;
+}
+
+message DataFilter {
+  repeated string globs = 1;
+  repeated string ignore_globs = 2;
+  repeated string custom_ignore_files = 3;
+  optional uint64 exclude_larger_than = 4;
+}
+
+message Summary {
+  uint64 files_new = 1;
+  uint64 files_changed = 2;
+  uint64 files_unmodified = 3;
+  uint64 total_files_processed = 4;
+  uint64 total_bytes_processed = 5;
+  uint64 dirs_new = 6;
+  uint64 dirs_changed = 7;
+  uint64 dirs_unmodified = 8;
+  uint64 total_dirs_processed = 9;
+  uint64 total_dirsize_processed = 10;
+  uint64 data_blobs = 11;
+  uint64 tree_blobs = 12;
+  uint64 data_added = 13;
+  uint64 data_added_packed = 14;
+  uint64 data_added_files = 15;
+  uint64 data_added_files_packed = 16;
+  uint64 data_added_trees = 17;
+  uint64 data_added_trees_packed = 18;
+  google.protobuf.Timestamp backup_start = 19;
+  google.protobuf.Timestamp backup_end = 20;
+}
+
+message VfsNode {
+  string name = 1;
+  bool is_dir = 2;
+  uint64 bytes = 3;
+  google.protobuf.Timestamp ctime = 4;
+  google.protobuf.Timestamp mtime = 5;
+  google.protobuf.Timestamp atime = 6;
+}
+
+message Snapshot {
+  string id = 1;
+  google.protobuf.Timestamp time = 2;
+  optional Summary summary = 3;
+  repeated string tags = 4;
+  repeated string paths = 5;
+  string app_version = 6;
+}
+
+message BackupArgs {
+  PointSource data_src = 2;
+  string backup_path = 3;
+  RepoSource repo_dest = 4;
+  optional DataFilter filter = 5;
+  repeated string tags = 6;
+  bool dry_run = 7;
+}
+
+message RestoreArgs {
+  RepoSource repo_src = 1;
+  string repo_path = 2;
+  PointSource data_dest = 3;
+  string data_path = 4;
+  string snapshot_id = 5;
+  bool delete = 6;
+  bool dry_run = 7;
+}
+
+message CheckArgs {
+  RepoSource repo_src = 1;
+}
+
+message ForgetArgs {
+  RepoSource repo_src = 1;
+  repeated string snapshots = 2;
+}
+
+message CancelArgs {
+  string job_id = 1;
+}
+
+message GetSnapshotArgs {
+  RepoSource repo_src = 1;
+}
+
+///////////////////////////////////////////////////////////////////
+
+message JobFinishedEvent {
+  string job_id = 1;
+  bool success = 2;
+  optional string snapshot = 3;
+  google.protobuf.Timestamp time = 4;
+}
+
+message JobNewMessageEvent {
+  string job_id = 1;
+  Priority priority = 2;
+  string message = 3;
+  google.protobuf.Timestamp time = 4;
+}
+
+message JobBarLengthSet {
+  string job_id = 1;
+  string bar_id = 2;
+  uint64 length = 3;
+  google.protobuf.Timestamp time = 4;
+}
+
+message JobBarTitleSet {
+  string job_id = 1;
+  string bar_id = 2;
+  string title = 3;
+  google.protobuf.Timestamp time = 4;
+}
+
+message JobBarIncrement {
+  string job_id = 1;
+  string bar_id = 2;
+  uint64 increment = 3;
+  google.protobuf.Timestamp time = 4;
+}
+
+message JobBarFinished {
+  string job_id = 1;
+  string bar_id = 2;
+  google.protobuf.Timestamp time = 3;
+}
+
+message JobEvent {
+  oneof data {
+    JobFinishedEvent jobFinished = 1;
+    JobNewMessageEvent jobMessage = 2;
+    JobBarLengthSet jobStepLengthSet = 3;
+    JobBarTitleSet jobStepTitleSet = 4;
+    JobBarIncrement jobStepIncrement = 5;
+    JobBarFinished jobStepFinished = 6;
+  }
+}
+
+///////////////////////////////////////////////////////////////////
+
+message PollResponse {
+  repeated JobEvent events = 1;
+}
+
+message JobStartResponse {
+  string job_id = 1;
+}
+
+message SnapshotResponse {
+  repeated Snapshot output = 1;
+}
+
+
+message JobCancelResponse {
+  string job_id = 1;
+}
+
+///////////////////////////////////////////////////////////////////
+
+message SetVfsArgs {
+  repeated VfsUser users = 1;
+}
+
+message ListVfsArgs {
+  string user = 1;
+  string path = 2;
+}
+
+message ListVfsResponse {
+  repeated VfsNode nodes = 1;
+}
+
+message ReadVfsArgs {
+  string user = 1;
+  string path = 2;
+  uint64 offset = 3;
+  uint64 length = 4;
+}
+
+message ReadVfsResponse {
+  bytes data = 1;
+}
+
+message AppendVfsArgs {
+  string user = 1;
+  string path = 2;
+  bytes data = 3;
+}
+
+message WriteVfsArgs {
+  string user = 1;
+  string path = 2;
+  bytes data = 3;
+  uint64 offset = 4;
+}
+
+message TouchVfsArgs {
+  string user = 1;
+  string path = 2;
+  bool is_dir = 3;
+}
+
+message InfoVfsArgs {
+  string user = 1;
+  string path = 2;
+}
+
+message Empty {}
+
+service IpcService {
+  rpc Backup(BackupArgs) returns (JobStartResponse);
+  rpc Restore(RestoreArgs) returns (JobStartResponse);
+  rpc Check(CheckArgs) returns (JobStartResponse);
+  rpc Forget(ForgetArgs) returns (JobStartResponse);
+  rpc GetSnapshots(GetSnapshotArgs) returns (SnapshotResponse);
+  rpc CancelJob(CancelArgs) returns (JobCancelResponse);
+  rpc Poll(Empty) returns (PollResponse);
+  rpc SetVfs(SetVfsArgs) returns (Empty);
+  rpc ListVfs(ListVfsArgs) returns (ListVfsResponse);
+  rpc ReadVfs(ReadVfsArgs) returns (ReadVfsResponse);
+  rpc AppendVfs(AppendVfsArgs) returns (Empty);
+  rpc WriteVfs(WriteVfsArgs) returns (Empty);
+  rpc TouchVfs(TouchVfsArgs) returns (Empty);
+}
