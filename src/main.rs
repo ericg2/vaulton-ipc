@@ -38,11 +38,13 @@ const TTL: Duration = Duration::from_mins(3);
 
 #[tokio::main]
 async fn main() {
+    use rustic_core::*;
     let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
     let ip = "127.0.0.1:8080".parse().expect("Failed to parse IP!");
     let db = Arc::new(DbManager::open("poop.sqlite").await.unwrap());
     let store = Arc::new(StorageManager::new(db.clone(), TTL));
     let serv = GrpcServer::new(store.clone(), db.clone());
+    
 
     Server::builder()
         .add_service(IpcServiceServer::new(serv))

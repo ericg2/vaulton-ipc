@@ -24,8 +24,8 @@ prost = "0.14"
 prost-types = "0.14"
 bytes = "1.12"
 
-rustic_backend = { path = "D:/rustic_core/crates/backend" }
-rustic_core = { path = "D:/rustic_core/crates/core" }
+rustic_backend = { git = "https://github.com/ericg2/rustic_core.git" }
+rustic_core = { git = "https://github.com/ericg2/rustic_core.git" }
 
 async-trait = "0.1.89"
 dashmap = "6.2.1"
