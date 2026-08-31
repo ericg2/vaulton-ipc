@@ -1,23 +1,23 @@
 //! [`StorageManager`] — unified cache for rustic repositories, VFS operators,
 //! and raw data-layer operators.
 
+use crate::core::{VfsError, VfsResult, VfsUser};
 use crate::db::DbManager;
 use crate::ipc::job_event::Data;
 use crate::progress::RusticProgressBars;
-use crate::vfs::{VfsError, VfsResult, VfsUser};
+use crate::vfs::VfsBuilder;
 use async_trait::async_trait;
 use crossbeam_channel::Sender;
 use moka::sync::Cache;
-use rustic_backend::opendal::opendal_ext::Operator;
-use rustic_backend::opendal::opendal_ext::config::{OpenDALConfig, Scheme};
-use rustic_backend::opendal::opendal_ext::vfs::VfsBuilder;
-use rustic_backend::{BackendBuilder, BackendOptions};
+use opendal_core::Operator;
 use rustic_backend::opendal::*;
+use rustic_backend::{BackendBuilder, BackendOptions};
 use rustic_core::{
     ConfigOptions, Credentials, ErrorKind, IndexedFullStatus, KeyOptions, OpenStatus, Repository,
     RepositoryOptions, RusticError, RusticResult,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -61,11 +61,11 @@ pub trait StorageSystem: Send + Sync + 'static {
 ///
 /// Used as the cache key for both [`get_repo`](StorageSystem::get_repo) and
 /// [`get_vfs_operator`](StorageSystem::get_vfs_operator).
-#[derive(Clone, Eq, PartialEq, Debug, Hash, Serialize, Deserialize)]
+#[derive(Hash, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub struct RepoSource {
     /// The OpenDAL scheme that locates the repository.
-    pub src: Scheme,
-    /// Plaintext password used to decrypt the repository.
+    pub scheme: String,
+    pub config: BTreeMap<String, String>,
     pub password: String,
 }
 
@@ -110,9 +110,10 @@ impl StorageManager {
     /// [`Repository::init`]; otherwise it is opened from existing storage.
     fn create_indexed(&self, src: &RepoSource, init: bool) -> RusticResult<RepoIndexed> {
         let creds = Credentials::password(&src.password);
-        let config = OpenDALConfig::new(&src.src);
-        let repo = OpenDALRepo::from_config(config);
-        let backend = BackendOptions::default().with_repo(&repo).to_backends()?;
+        let config = OpenDALConfig::default()
+            .scheme(src.scheme.clone())
+            .options(src.config.clone().into_iter().collect::<HashMap<_, _>>());
+        let backend = BackendOptions::default().with_repo(&config).to_backends()?;
         let repo = Repository::new(&RepositoryOptions::default(), &backend)?;
         if init {
             repo.init(&creds, &KeyOptions::default(), &ConfigOptions::default())?
@@ -132,9 +133,10 @@ impl StorageManager {
         init: bool,
     ) -> RusticResult<RepoIndexed> {
         let creds = Credentials::password(&src.password);
-        let config = OpenDALConfig::new(&src.src);
-        let repo = OpenDALRepo::default().config(config);
-        let backend = BackendOptions::default().with_repo(&repo).to_backends()?;
+        let config = OpenDALConfig::default()
+            .scheme(src.scheme.clone())
+            .options(src.config.clone().into_iter().collect::<HashMap<_, _>>());
+        let backend = BackendOptions::default().with_repo(&config).to_backends()?;
         let pb = RusticProgressBars::new(job_id, tx);
         let repo = Repository::new_with_progress(&RepositoryOptions::default(), &backend, pb)?;
         if init {
@@ -160,16 +162,16 @@ impl StorageManager {
         // Ensure the repo exists, initializing it if this is the first access.
         self.get_raw_repo(src)?;
 
-        let config = OpenDALConfig::new(&src.src);
-        let repo = OpenDALRepo::from_config(config);
+        let config = OpenDALConfig::default()
+            .scheme(src.scheme.clone())
+            .options(src.config.clone().into_iter().collect::<HashMap<_, _>>());
         let op = Operator::new(
             RusticVfsBuilder::default()
                 .with_options(RepositoryOptions::default())
-                .with_backend(BackendOptions::default().with_repo(&repo))
+                .with_backend(BackendOptions::default().with_repo(&config))
                 .with_credentials(Credentials::password(&src.password)),
         )
-        .map_err(|e| RusticError::with_source(ErrorKind::Vfs, "Failed to initialize VFS", e))?
-        .finish();
+        .map_err(|e| RusticError::with_source(ErrorKind::Vfs, "Failed to initialize VFS", e))?;
         Ok(op)
     }
 
@@ -182,22 +184,22 @@ impl StorageManager {
                     .clone()
                     .ok_or(VfsError::RepoPasswordMissing)?;
 
-                let config = OpenDALConfig::new(&point.scheme);
-                let repo = OpenDALRepo::from_config(config);
+                let config = OpenDALConfig::default()
+                    .scheme(point.scheme.clone())
+                    .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
                 let scheme = RusticVfsConfig {
                     options: RepositoryOptions::default(),
-                    backend: BackendOptions::default().with_repo(&repo),
+                    backend: BackendOptions::default().with_repo(&config),
                     credentials: Some(Credentials::password(&pass)),
                     refresh_interval: Some(Duration::from_mins(2)),
                 };
 
-                let op = Operator::from_config(scheme)?.finish();
-                vfs = vfs
-                    .mount_operator(format!("/repos/{}", &point.name), op)
-                    .read_only(); // *** it won't allow anyway; but it prevents strange errors.
+                let op = Operator::from_config(scheme)?;
+                vfs = vfs.mount(format!("/repos/{}", &point.name), op).read_only(); // *** it won't allow anyway; but it prevents strange errors.
             } else {
                 // If the point is a data point - it becomes better!
-                vfs = vfs.mount(format!("/points/{}", &point.name), point.scheme.clone());
+                let op = Operator::via_iter(&point.scheme, point.config.clone())?;
+                vfs = vfs.mount(format!("/points/{}", &point.name), op);
                 if point.read_only {
                     vfs = vfs.read_only();
                 } else if let Some(max) = point.max_bytes {
@@ -205,7 +207,7 @@ impl StorageManager {
                 }
             }
         }
-        Ok(Operator::new(vfs)?.finish())
+        Ok(Operator::new(vfs)?)
     }
 }
 

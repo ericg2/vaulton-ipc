@@ -25,7 +25,10 @@ mod db;
 pub mod progress;
 pub mod server;
 pub mod store;
+mod core;
+mod quota;
 mod vfs;
+mod read_only;
 
 pub(crate) fn proto_stamp(ts: rustic_core::jiff::Timestamp) -> Option<Timestamp> {
     Some(Timestamp {

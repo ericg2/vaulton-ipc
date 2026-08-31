@@ -1,12 +1,11 @@
-use crate::vfs::{UserSystem, VfsError, VfsPoint, VfsResult, VfsUser};
+use crate::quota::QuotaTracker;
+use crate::core::{UserSystem, VfsError, VfsPoint, VfsResult, VfsUser};
 use async_trait::async_trait;
-use rustic_backend::opendal::opendal_ext;
+use opendal_core::ErrorKind;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use std::path::Path;
 use std::str::FromStr;
-use rustic_backend::opendal::opendal_ext::ErrorKind;
-use rustic_backend::opendal::opendal_ext::quota::QuotaTracker;
 
 /// SQLite-backed implementation of [`VfsStore`] and [`QuotaTracker`].
 ///
@@ -164,13 +163,13 @@ impl UserSystem for DbManager {
 
 #[async_trait]
 impl QuotaTracker for DbManager {
-    async fn get_bytes_written(&self, id: &str) -> opendal_ext::Result<u64> {
+    async fn get_bytes_written(&self, id: &str) -> opendal_core::Result<u64> {
         let row: Option<(i64,)> = sqlx::query_as("SELECT bytes_written FROM quota WHERE id = ?1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|x| {
-                opendal_ext::Error::new(ErrorKind::Unexpected, "Failed to get bytes written")
+                opendal_core::Error::new(ErrorKind::Unexpected, "Failed to get bytes written")
                     .set_source(x)
                     .set_temporary()
             })?;
@@ -179,7 +178,7 @@ impl QuotaTracker for DbManager {
         Ok(row.map(|(b,)| b as u64).unwrap_or(0))
     }
 
-    async fn set_bytes_written(&self, id: &str, bytes: u64) -> opendal_ext::Result<()> {
+    async fn set_bytes_written(&self, id: &str, bytes: u64) -> opendal_core::Result<()> {
         sqlx::query(
             r#"
             INSERT INTO quota (id, bytes_written)
@@ -192,7 +191,7 @@ impl QuotaTracker for DbManager {
         .execute(&self.pool)
         .await
         .map_err(|x| {
-            opendal_ext::Error::new(ErrorKind::Unexpected, "Failed to set bytes written")
+            opendal_core::Error::new(ErrorKind::Unexpected, "Failed to set bytes written")
                 .set_source(x)
                 .set_temporary()
         })?;
@@ -232,8 +231,7 @@ impl TryFrom<UserRow> for VfsUser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustic_backend::opendal::opendal_ext::config::Scheme;
-    use rustic_backend::opendal::opendal_ext::services::S3Config;
+    use std::collections::{BTreeMap, HashMap};
 
     fn dummy_user(name: &str) -> VfsUser {
         VfsUser {
@@ -243,7 +241,8 @@ mod tests {
                 name: "primary".to_string(),
                 max_bytes: Some(1_073_741_824),
                 read_only: false,
-                scheme: Scheme::S3(S3Config::default()),
+                scheme: "s3".into(),
+                config: BTreeMap::new(),
                 is_repo: false,
                 repo_password: None,
             }],

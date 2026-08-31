@@ -2,27 +2,26 @@
 
 use crossbeam_channel as chan;
 use dashmap::DashMap;
-use opendal_ext::config::{OpenDALConfig, Scheme};
-use opendal_ext::Buffer;
 use prost_types::Timestamp;
+use rustic_backend::opendal::{OpenDALConfig, OpenDALSource};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
-use rustic_backend::opendal::{opendal_ext, OpenDALDestination, OpenDALSource};
+use opendal_core::Buffer;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
 use crate::ipc::job_event::Data;
-use crate::ipc::vfs_point::Src as ProtoSrc;
+use crate::ipc::vfs_point::{Src as ProtoSrc, Src};
 use crate::ipc::{
     AppendVfsArgs, BackupArgs, CancelArgs, CheckArgs, Empty, ForgetArgs, GetSnapshotArgs,
     JobCancelResponse, JobEvent, JobFinishedEvent, JobNewMessageEvent, JobStartResponse,
-    ListVfsArgs, ListVfsResponse, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse,
-    RepoSource as ProtoRepoSource, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, Summary,
-    TouchVfsArgs, VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteVfsArgs,
+    ListVfsArgs, ListVfsResponse, PointSource as ProtoDataSource, PollResponse, Priority,
+    ReadVfsArgs, ReadVfsResponse, RepoSource as ProtoRepoSource, RestoreArgs, SetVfsArgs, Snapshot,
+    SnapshotResponse, Summary, TouchVfsArgs, VfsNode, VfsPoint as ProtoVfsPoint,
+    VfsUser as ProtoVfsUser, WriteVfsArgs,
 };
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
@@ -31,8 +30,8 @@ use rustic_core::{
     StringList,
 };
 
+use crate::core::{UserSystem, VfsError, VfsPoint, VfsUser};
 use crate::store::{RepoSource, StorageSystem};
-use crate::vfs::{UserSystem, VfsError, VfsPoint, VfsUser};
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
@@ -55,10 +54,10 @@ fn map_vfs(e: VfsError) -> Status {
     }
 }
 
-fn map_dal(e: opendal_ext::Error) -> Status {
+fn map_dal(e: opendal_core::Error) -> Status {
     match e.kind() {
-        opendal_ext::ErrorKind::NotFound => not_found(e.to_string()),
-        opendal_ext::ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
+        opendal_core::ErrorKind::NotFound => not_found(e.to_string()),
+        opendal_core::ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
         _ => internal(e),
     }
 }
@@ -78,15 +77,17 @@ fn opt_ts(dt: Option<Zoned>) -> Option<Timestamp> {
 
 // ── Domain conversions ────────────────────────────────────────────────────────
 
-fn parse_scheme(s: &str) -> Result<Scheme, Status> {
-    serde_json::from_str(s).map_err(|e| invalid(format!("invalid scheme '{s}': {e}")))
-}
-
 fn parse_repo_src(p: ProtoRepoSource) -> Result<RepoSource, Status> {
+    let src = p.src.ok_or(invalid("missing repo src"))?;
     Ok(RepoSource {
-        src: parse_scheme(&p.src)?,
+        scheme: src.scheme,
+        config: src.config.into_iter().collect(),
         password: p.password,
     })
+}
+
+fn parse_data_src(p: ProtoDataSource) -> Result<OpenDALConfig, Status> {
+    Ok(OpenDALConfig::default().scheme(p.scheme).options(p.config))
 }
 
 fn require_repo_src(
@@ -96,20 +97,32 @@ fn require_repo_src(
     parse_repo_src(opt.ok_or_else(|| invalid(format!("missing {field}")))?)
 }
 
+fn require_data_src(
+    opt: Option<ProtoDataSource>,
+    field: &'static str,
+) -> Result<OpenDALConfig, Status> {
+    parse_data_src(opt.ok_or_else(|| invalid(format!("missing {field}")))?)
+}
+
 impl TryFrom<ProtoVfsPoint> for VfsPoint {
     type Error = Status;
 
     fn try_from(p: ProtoVfsPoint) -> Result<Self, Status> {
-        let (src_str, is_repo, repo_password) = match p.src {
-            Some(ProtoSrc::Data(ps)) => (ps.src, false, None),
-            Some(ProtoSrc::Repo(rs)) => (rs.src, true, Some(rs.password)),
+        let (scheme, config, is_repo, repo_password) = match p.src {
+            Some(ProtoSrc::Data(ps)) => (ps.scheme, ps.config, false, None),
+            Some(ProtoSrc::Repo(rs)) => match rs.src {
+                None => return Err(invalid("VfsPoint[repo].src is required")),
+                Some(x) => (x.scheme, x.config, true, Some(rs.password)),
+            },
             None => return Err(invalid("VfsPoint.src is required")),
         };
+
         Ok(VfsPoint {
             name: p.name,
             max_bytes: (p.max_bytes != 0).then_some(p.max_bytes),
             read_only: !p.can_write,
-            scheme: parse_scheme(&src_str)?,
+            scheme,
+            config: config.into_iter().collect(),
             is_repo,
             repo_password,
         })
@@ -173,7 +186,7 @@ impl From<SnapshotFile> for Snapshot {
 }
 
 /// Convert an opendal directory entry to the proto node type.
-fn entry_to_node(entry: &opendal_ext::Entry) -> VfsNode {
+fn entry_to_node(entry: &opendal_core::Entry) -> VfsNode {
     let meta = entry.metadata();
     let name = entry
         .path()
@@ -241,12 +254,12 @@ where
     fn spawn_job<F>(&self, f: F) -> String
     where
         F: FnOnce(
-            Uuid,
-            chan::Sender<Data>,
-            CancelToken,
-        ) -> rustic_core::RusticResult<Option<String>>
-        + Send
-        + 'static,
+                Uuid,
+                chan::Sender<Data>,
+                CancelToken,
+            ) -> rustic_core::RusticResult<Option<String>>
+            + Send
+            + 'static,
     {
         let job_id = Uuid::new_v4();
         let token = CancelToken::new();
@@ -308,24 +321,24 @@ where
     async fn backup(&self, req: Request<BackupArgs>) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
         let repo_src = require_repo_src(args.repo_dest, "repo_dest")?;
-        let src_scheme = parse_scheme(
-            &args
-                .data_src
-                .ok_or_else(|| invalid("missing data_src"))?
-                .src,
-        )?;
+        let config = require_data_src(args.data_src, "data_src")?;
         let backup_path = PathBuf::from(args.backup_path);
         let tags = args.tags;
         let storage = Arc::clone(&self.inner.storage);
 
         let job_id = self.spawn_job(move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
-            let config = OpenDALConfig::new(&src_scheme);
-            let source = OpenDALSource::new(&config, backup_path);
+            let source = OpenDALSource::from_config(&config)?;
             let tags = StringList::from_str(&tags.join(",")).unwrap();
             let snap = SnapshotOptions::default().tags(vec![tags]).to_snapshot()?;
             let repo = handle.block_on(storage.get_repo_job(&repo_src, job_id, tx))?;
-            let saved = repo.backup(&BackupOptions::default(), &source, snap, token)?;
+            let saved = repo.backup_with(
+                &BackupOptions::default(),
+                &source,
+                snap,
+                backup_path.into(),
+                token,
+            )?;
             Ok(Some(saved.id.to_string()))
         });
 
@@ -340,12 +353,8 @@ where
     ) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
         let repo_src = require_repo_src(args.repo_src, "repo_src")?;
-        let dest_scheme = parse_scheme(
-            &args
-                .data_dest
-                .ok_or_else(|| invalid("missing data_dest"))?
-                .src,
-        )?;
+
+        let dest_scheme = require_data_src(args.data_dest, "data_dest")?;
         let restore_path = PathBuf::from(&args.data_path);
         let snapshot_id = args.snapshot_id;
         let delete = args.delete;
@@ -356,14 +365,13 @@ where
         let job_id = self.spawn_job(move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
             let repo = Arc::new(handle.block_on(storage.get_repo_job(&repo_src, job_id, tx))?);
-            let config = OpenDALConfig::new(&dest_scheme);
-            let dest = OpenDALDestination::new(&restore_path, &config);
+            let dest = OpenDALSource::from_config(&dest_scheme)?;
             let opts = RestoreOptions::default().delete(delete);
             let snap_path = format!("{}:{}", &snapshot_id, &repo_path);
             let node = repo.node_from_snapshot_path(&snap_path, |_| true)?;
             let streamer_opts = LsOptions::default();
             let ls = repo.ls(&node, &streamer_opts)?;
-            let plan = repo.prepare_restore(&opts, ls.clone(), &dest, dry_run, token.clone())?;
+            let plan = repo.prepare_restore(&opts, ls.clone(), &dest, &restore_path, dry_run, token.clone())?;
             if !dry_run {
                 repo.restore(plan, &opts, ls.clone(), &dest, token)?;
             }
@@ -503,13 +511,13 @@ where
         req: Request<ListVfsArgs>,
     ) -> Result<Response<ListVfsResponse>, Status> {
         let args = req.into_inner();
-        let user = self.inner.users.load_user(&args.user).await.map_err(map_vfs)?;
-        let op = self
+        let user = self
             .inner
-            .storage
-            .get_vfs(&user)
+            .users
+            .load_user(&args.user)
             .await
             .map_err(map_vfs)?;
+        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
 
         let entries = op.list_with(&args.path).await.map_err(map_dal)?;
 
@@ -525,13 +533,13 @@ where
         req: Request<ReadVfsArgs>,
     ) -> Result<Response<ReadVfsResponse>, Status> {
         let args = req.into_inner();
-        let user = self.inner.users.load_user(&args.user).await.map_err(map_vfs)?;
-        let op = self
+        let user = self
             .inner
-            .storage
-            .get_vfs(&user)
+            .users
+            .load_user(&args.user)
             .await
             .map_err(map_vfs)?;
+        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
 
         let buf = if args.length == 0 {
             op.read(&args.path).await.map_err(map_dal)?
@@ -551,13 +559,13 @@ where
 
     async fn append_vfs(&self, req: Request<AppendVfsArgs>) -> Result<Response<Empty>, Status> {
         let args = req.into_inner();
-        let user = self.inner.users.load_user(&args.user).await.map_err(map_vfs)?;
-        let op = self
+        let user = self
             .inner
-            .storage
-            .get_vfs(&user)
+            .users
+            .load_user(&args.user)
             .await
             .map_err(map_vfs)?;
+        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
 
         op.write_with(&args.path, args.data)
             .append(true)
@@ -571,13 +579,13 @@ where
 
     async fn write_vfs(&self, req: Request<WriteVfsArgs>) -> Result<Response<Empty>, Status> {
         let args = req.into_inner();
-        let user = self.inner.users.load_user(&args.user).await.map_err(map_vfs)?;
-        let op = self
+        let user = self
             .inner
-            .storage
-            .get_vfs(&user)
+            .users
+            .load_user(&args.user)
             .await
             .map_err(map_vfs)?;
+        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
 
         if args.offset == 0 {
             op.write(&args.path, args.data).await.map_err(map_dal)?;
@@ -608,13 +616,13 @@ where
 
     async fn touch_vfs(&self, req: Request<TouchVfsArgs>) -> Result<Response<Empty>, Status> {
         let args = req.into_inner();
-        let user = self.inner.users.load_user(&args.user).await.map_err(map_vfs)?;
-        let op = self
+        let user = self
             .inner
-            .storage
-            .get_vfs(&user)
+            .users
+            .load_user(&args.user)
             .await
             .map_err(map_vfs)?;
+        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
 
         if args.is_dir {
             let path = if args.path.ends_with('/') {

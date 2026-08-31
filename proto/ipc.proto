@@ -3,12 +3,13 @@ package ipc;
 import "google/protobuf/timestamp.proto";
 
 message RepoSource {
-  string src = 1;
+  PointSource src = 1;
   string password = 2;
 }
 
 message PointSource {
-  string src = 1;
+  string scheme = 1;
+  map<string, string> config = 2;
 }
 
 message VfsPoint {
