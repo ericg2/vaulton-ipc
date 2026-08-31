@@ -21,7 +21,7 @@ use crate::vfs::lister::MountLister;
 use crate::vfs::reader::MountReader;
 use crate::vfs::util;
 use crate::vfs::writer::MountWriter;
-use opendal_core::raw::oio::ReadStreamDyn;
+use opendal_core::raw::oio::{OneShotCopier, ReadStreamDyn};
 use opendal_core::raw::*;
 use opendal_core::{
     Buffer, Builder, BytesRange, Capability, EntryMode, Error, ErrorKind, Lister, Metadata,
@@ -253,7 +253,7 @@ impl Service for MountAccess {
     type Writer = MountWriter;
     type Lister = MountLister;
     type Deleter = MountDeleter;
-    type Copier = ();
+    type Copier = OneShotCopier;
 
     fn info(&self) -> ServiceInfo {
         ServiceInfo::new("mount", "/", "mount")
@@ -267,6 +267,8 @@ impl Service for MountAccess {
             create_dir: true,
             delete: true,
             list: true,
+            copy: true,
+            rename: true,
             ..Default::default()
         }
     }
@@ -370,25 +372,106 @@ impl Service for MountAccess {
         }
     }
 
+    /// Build a [`OneShotCopier`] for `from` -> `to`.
+    ///
+    /// Synchronous and does no I/O itself: it only resolves both paths'
+    /// mounts up front (so bad paths / read-only targets fail immediately,
+    /// before any copy is attempted) and stashes a future factory that does
+    /// the actual work lazily. When both paths land in the same mount *and*
+    /// that mount's backend advertises native copy support, the copy is
+    /// delegated directly to `Operator::copy`. Otherwise (different mounts,
+    /// or a backend like `memory` that doesn't implement copy at all) it
+    /// falls back to a manual read-then-write.
     fn copy(
         &self,
         _ctx: &OperationContext,
-        _from: &str,
-        _to: &str,
+        from: &str,
+        to: &str,
         _args: OpCopy,
         _opts: OpCopier,
     ) -> Result<Self::Copier> {
-        Err(util::unsupported("copy"))
+        let Some((from_path, from_mount, from_rel)) = util::resolve(&self.mounts, from) else {
+            return Err(util::not_found(from));
+        };
+        let Some((to_path, to_mount, to_rel)) = util::resolve(&self.mounts, to) else {
+            return Err(util::not_found(to));
+        };
+
+        if to_mount.read_only {
+            return Err(util::permission_denied(to));
+        }
+
+        // Only delegate to the backend's native `copy` when both paths land
+        // in the same mount *and* that backend actually advertises support
+        // for it - plenty of services (e.g. `memory`) don't implement copy
+        // at all and will return `Unsupported` if asked.
+        let delegate = from_path == to_path && from_mount.operator.info().capability().copy;
+        let from_op = from_mount.operator.clone();
+        let to_op = to_mount.operator.clone();
+
+        Ok(OneShotCopier::new_with(move || {
+            let from_op = from_op.clone();
+            let to_op = to_op.clone();
+            let from_rel = from_rel.clone();
+            let to_rel = to_rel.clone();
+
+            async move {
+                if delegate {
+                    from_op.copy(&from_rel, &to_rel).await?;
+                } else {
+                    let data = from_op.read(&from_rel).await?;
+                    to_op.write(&to_rel, data).await?;
+                }
+
+                to_op.stat(&to_rel).await
+            }
+        }))
     }
 
+    /// Rename `from` to `to`.
+    ///
+    /// Both paths must resolve to a mount, and the mount(s) involved must
+    /// not be read-only. Same-mount renames delegate straight to the
+    /// underlying `Operator::rename` when that backend advertises native
+    /// rename support. Otherwise - cross-mount, or a backend like `memory`
+    /// that doesn't implement rename - it's emulated as read-write-delete.
     fn rename(
         &self,
         _ctx: &OperationContext,
-        _from: &str,
-        _to: &str,
+        from: &str,
+        to: &str,
         _args: OpRename,
     ) -> impl Future<Output = Result<RpRename>> + MaybeSend {
-        async { Err(util::unsupported("rename")) }
+        let mounts = self.mounts.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+
+        async move {
+            let Some((from_path, from_mount, from_rel)) = util::resolve(&mounts, &from) else {
+                return Err(util::not_found(&from));
+            };
+            let Some((to_path, to_mount, to_rel)) = util::resolve(&mounts, &to) else {
+                return Err(util::not_found(&to));
+            };
+
+            if from_mount.read_only {
+                return Err(util::permission_denied(&from));
+            }
+            if to_mount.read_only {
+                return Err(util::permission_denied(&to));
+            }
+
+            let delegate = from_path == to_path && from_mount.operator.info().capability().rename;
+            if delegate {
+                from_mount.operator.rename(&from_rel, &to_rel).await?;
+            } else {
+                let data = from_mount.operator.read(&from_rel).await?;
+                to_mount.operator.write(&to_rel, data).await?;
+                from_mount.operator.delete(&from_rel).await?;
+            }
+
+            Ok(RpRename::default())
+        }
     }
 
     fn presign(
@@ -557,6 +640,129 @@ mod tests {
             op.stat("/scratch/b.txt").await.unwrap_err().kind(),
             ErrorKind::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn copy_within_the_same_mount_delegates_to_the_operator() {
+        let op = Operator::new(builder().mount("/repos/test", memory())).unwrap();
+
+        op.write("/repos/test/a.txt", "hello").await.unwrap();
+        op.copy("/repos/test/a.txt", "/repos/test/b.txt")
+            .await
+            .unwrap();
+
+        let data = op.read("/repos/test/b.txt").await.unwrap();
+        assert_eq!(data.to_vec(), b"hello");
+
+        // original should be untouched by a copy
+        let data = op.read("/repos/test/a.txt").await.unwrap();
+        assert_eq!(data.to_vec(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn copy_across_mounts_falls_back_to_read_and_write() {
+        let op = Operator::new(
+            builder()
+                .mount("/repos/test", memory())
+                .mount("/scratch", memory()),
+        )
+        .unwrap();
+
+        op.write("/repos/test/a.txt", "hello").await.unwrap();
+        op.copy("/repos/test/a.txt", "/scratch/a.txt")
+            .await
+            .unwrap();
+
+        let data = op.read("/scratch/a.txt").await.unwrap();
+        assert_eq!(data.to_vec(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn copy_into_a_read_only_mount_is_rejected() {
+        let op = Operator::new(
+            builder()
+                .mount("/repos/test", memory())
+                .mount("/scratch", memory())
+                .read_only(),
+        )
+        .unwrap();
+
+        op.write("/repos/test/a.txt", "hello").await.unwrap();
+
+        let err = op
+            .copy("/repos/test/a.txt", "/scratch/a.txt")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn copy_from_a_path_outside_any_mount_is_not_found() {
+        let op = Operator::new(builder().mount("/repos/test", memory())).unwrap();
+
+        let err = op
+            .copy("/elsewhere/a.txt", "/repos/test/a.txt")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn rename_within_the_same_mount_delegates_to_the_operator() {
+        let op = Operator::new(builder().mount("/repos/test", memory())).unwrap();
+
+        op.write("/repos/test/a.txt", "hello").await.unwrap();
+        op.rename("/repos/test/a.txt", "/repos/test/b.txt")
+            .await
+            .unwrap();
+
+        let data = op.read("/repos/test/b.txt").await.unwrap();
+        assert_eq!(data.to_vec(), b"hello");
+
+        assert_eq!(
+            op.stat("/repos/test/a.txt").await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_across_mounts_moves_the_file() {
+        let op = Operator::new(
+            builder()
+                .mount("/repos/test", memory())
+                .mount("/scratch", memory()),
+        )
+        .unwrap();
+
+        op.write("/repos/test/a.txt", "hello").await.unwrap();
+        op.rename("/repos/test/a.txt", "/scratch/a.txt")
+            .await
+            .unwrap();
+
+        let data = op.read("/scratch/a.txt").await.unwrap();
+        assert_eq!(data.to_vec(), b"hello");
+
+        assert_eq!(
+            op.stat("/repos/test/a.txt").await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_out_of_a_read_only_mount_is_rejected() {
+        let op = Operator::new(
+            builder()
+                .mount("/repos/test", memory())
+                .read_only()
+                .mount("/scratch", memory()),
+        )
+        .unwrap();
+
+        let err = op
+            .rename("/repos/test/a.txt", "/scratch/a.txt")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]
