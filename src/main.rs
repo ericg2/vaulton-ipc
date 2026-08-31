@@ -47,7 +47,6 @@ async fn main() {
     let db = Arc::new(DbManager::open("poop.sqlite").await.unwrap());
     let store = Arc::new(StorageManager::new(db.clone(), TTL));
     let serv = GrpcServer::new(store.clone(), db.clone());
-    
 
     Server::builder()
         .add_service(IpcServiceServer::new(serv))

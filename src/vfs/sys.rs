@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_lite::StreamExt;
@@ -15,19 +16,17 @@ use tokio::sync::OnceCell;
 
 use crate::quota::{MemoryTracker, QuotaLayer, QuotaTracker};
 use crate::read_only::ReadOnlyLayer;
-use opendal_core::raw::*;
-use opendal_core::{Buffer, Builder, BytesRange, Capability, EntryMode, Error, ErrorKind, Lister, Metadata, OperationContext, Operator, Result, Writer};
+use crate::vfs::deleter::MountDeleter;
+use crate::vfs::lister::MountLister;
+use crate::vfs::reader::MountReader;
+use crate::vfs::util;
+use crate::vfs::writer::MountWriter;
 use opendal_core::raw::oio::ReadStreamDyn;
-
-fn normalize(path: &str) -> String {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{trimmed}")
-    }
-}
-
+use opendal_core::raw::*;
+use opendal_core::{
+    Buffer, Builder, BytesRange, Capability, EntryMode, Error, ErrorKind, Lister, Metadata,
+    OperationContext, Operator, Result, Writer,
+};
 // ---------------------------------------------------------------------------
 // Builder internals
 // ---------------------------------------------------------------------------
@@ -144,7 +143,7 @@ impl VfsBuilder {
     /// configure the mount just added.
     pub fn mount(mut self, path: impl Into<String>, operator: Operator) -> Self {
         self.pending.push(PendingMount {
-            path: normalize(&path.into()),
+            path: util::normalize(&path.into()),
             operator,
             read_only: false,
             quota: VfsQuota::Disabled,
@@ -177,45 +176,14 @@ impl VfsBuilder {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct Mount {
-    operator: Operator,
-    read_only: bool,
-}
-
-/// Find the mount (if any) that owns `path`, and the path made relative to
-/// that mount's root. "Owns" means `path` equals the mount path or is nested
-/// under it. If multiple configured mounts could match, the longest
-/// (most specific) one wins.
-fn resolve<'a>(
-    mounts: &'a BTreeMap<String, Mount>,
-    path: &str,
-) -> Option<(&'a str, &'a Mount, String)> {
-    let normalized = normalize(path);
-    mounts
-        .iter()
-        .filter(|(mount_path, _)| {
-            normalized == mount_path.as_str() || normalized.starts_with(&format!("{mount_path}/"))
-        })
-        .max_by_key(|(mount_path, _)| mount_path.len())
-        .map(|(mount_path, mount)| {
-            let rel = normalized
-                .strip_prefix(mount_path.as_str())
-                .unwrap()
-                .trim_start_matches('/');
-
-            let mut rel = rel.to_string();
-
-            if path.ends_with('/') && !rel.is_empty() && !rel.ends_with('/') {
-                rel.push('/');
-            }
-
-            (mount_path.as_str(), mount, rel)
-        })
+pub struct Mount {
+    pub operator: Operator,
+    pub read_only: bool,
 }
 
 /// True if `path` is a virtual ancestor directory of at least one mount.
 fn virtual_children(mounts: &BTreeMap<String, Mount>, path: &str) -> Option<Vec<String>> {
-    let normalized = normalize(path);
+    let normalized = util::normalize(path);
 
     let prefix = if normalized == "/" {
         "/".to_string()
@@ -256,8 +224,8 @@ pub struct MountAccess {
 
 impl MountAccess {
     async fn metadata(&self, path: &str) -> Result<Metadata> {
-        if let Some((mount_path, mount, rel)) = resolve(&self.mounts, path) {
-            if normalize(path) == mount_path && rel.is_empty() {
+        if let Some((mount_path, mount, rel)) = util::resolve(&self.mounts, path) {
+            if util::normalize(path) == mount_path && rel.is_empty() {
                 return Ok(Metadata::new(EntryMode::DIR));
             }
 
@@ -268,7 +236,7 @@ impl MountAccess {
             return Ok(Metadata::new(EntryMode::DIR));
         }
 
-        Err(not_found(path))
+        Err(util::not_found(path))
     }
 }
 
@@ -280,23 +248,8 @@ impl Debug for MountAccess {
     }
 }
 
-fn not_found(path: &str) -> Error {
-    Error::new(ErrorKind::NotFound, "no mount covers this path").with_context("path", path)
-}
-
-fn permission_denied(path: &str) -> Error {
-    Error::new(ErrorKind::PermissionDenied, "mount is read-only").with_context("path", path)
-}
-
-fn unsupported(op: &'static str) -> Error {
-    Error::new(
-        ErrorKind::Unsupported,
-        format!("MountFs does not support `{op}`."),
-    )
-}
-
 impl Service for MountAccess {
-    type Reader = MountReader;
+    type Reader = oio::PositionReader<MountReader>;
     type Writer = MountWriter;
     type Lister = MountLister;
     type Deleter = MountDeleter;
@@ -324,16 +277,16 @@ impl Service for MountAccess {
         path: &str,
         _args: OpCreateDir,
     ) -> Result<RpCreateDir> {
-        match resolve(&self.mounts, path) {
+        match util::resolve(&self.mounts, path) {
             Some((_, mount, rel)) => {
                 if mount.read_only {
-                    return Err(permission_denied(path));
+                    return Err(util::permission_denied(path));
                 }
 
                 mount.operator.create_dir(&rel).await?;
                 Ok(RpCreateDir::default())
             }
-            None => Err(not_found(path)),
+            None => Err(util::not_found(path)),
         }
     }
 
@@ -349,11 +302,12 @@ impl Service for MountAccess {
     /// metadata) happens lazily, the first time [`oio::Read::read`] is
     /// called on the returned reader.
     fn read(&self, _ctx: &OperationContext, path: &str, _args: OpRead) -> Result<Self::Reader> {
-        let Some((_, mount, rel)) = resolve(&self.mounts, path) else {
-            return Err(not_found(path));
+        let Some((_, mount, rel)) = util::resolve(&self.mounts, path) else {
+            return Err(util::not_found(path));
         };
 
-        Ok(MountReader::new(mount.operator.clone(), rel))
+        let rdr = MountReader::new(mount.operator.clone(), rel);
+        Ok(oio::PositionReader::new(rdr))
     }
 
     /// Construct a [`MountWriter`] for `path`.
@@ -362,21 +316,17 @@ impl Service for MountAccess {
     /// mount's `Operator::writer` is only opened lazily on the first call to
     /// [`oio::Write::write`]/`close`/`abort`.
     fn write(&self, _ctx: &OperationContext, path: &str, _args: OpWrite) -> Result<Self::Writer> {
-        let Some((_, mount, rel)) = resolve(&self.mounts, path) else {
-            return Err(not_found(path));
+        let Some((_, mount, rel)) = util::resolve(&self.mounts, path) else {
+            return Err(util::not_found(path));
         };
-
         if mount.read_only {
-            return Err(permission_denied(path));
+            return Err(util::permission_denied(path));
         }
-
         Ok(MountWriter::new(mount.operator.clone(), rel))
     }
 
     fn delete(&self, _ctx: &OperationContext) -> Result<Self::Deleter> {
-        Ok(MountDeleter {
-            mounts: self.mounts.clone(),
-        })
+        Ok(MountDeleter(self.mounts.clone()))
     }
 
     /// Construct a [`MountLister`] for `path`.
@@ -387,7 +337,7 @@ impl Service for MountAccess {
     /// directory, the synthetic child entries are built up front since no
     /// I/O is required for those.
     fn list(&self, _ctx: &OperationContext, path: &str, _args: OpList) -> Result<Self::Lister> {
-        if let Some((mount_path, mount, rel)) = resolve(&self.mounts, path) {
+        if let Some((mount_path, mount, rel)) = util::resolve(&self.mounts, path) {
             debug!("LIST {path} to {}", &rel);
 
             return Ok(MountLister::Real {
@@ -400,8 +350,7 @@ impl Service for MountAccess {
 
         match virtual_children(&self.mounts, path) {
             Some(children) => {
-                let base = normalize(path);
-
+                let base = util::normalize(path);
                 let entries = children
                     .into_iter()
                     .map(|name| {
@@ -417,7 +366,7 @@ impl Service for MountAccess {
 
                 Ok(MountLister::Virtual { entries })
             }
-            None => Err(not_found(path)),
+            None => Err(util::not_found(path)),
         }
     }
 
@@ -429,7 +378,7 @@ impl Service for MountAccess {
         _args: OpCopy,
         _opts: OpCopier,
     ) -> Result<Self::Copier> {
-        Err(unsupported("copy"))
+        Err(util::unsupported("copy"))
     }
 
     fn rename(
@@ -439,7 +388,7 @@ impl Service for MountAccess {
         _to: &str,
         _args: OpRename,
     ) -> impl Future<Output = Result<RpRename>> + MaybeSend {
-        async { Err(unsupported("rename")) }
+        async { Err(util::unsupported("rename")) }
     }
 
     fn presign(
@@ -448,251 +397,7 @@ impl Service for MountAccess {
         _path: &str,
         _args: OpPresign,
     ) -> impl Future<Output = Result<RpPresign>> + MaybeSend {
-        async { Err(unsupported("presign")) }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reader / Writer / Lister / Deleter bridges
-// ---------------------------------------------------------------------------
-
-/// [`oio::Read`] implementation for a mounted path.
-///
-/// `MountReader` is fully lazy: it's constructed with just the owning
-/// mount's `Operator` and the relative path, doing no I/O. The first call to
-/// [`oio::Read::read`] resolves the entry's [`Metadata`] (via `stat`,
-/// cached in a [`OnceCell`] so later calls reuse it) and issues a ranged
-/// read against the mounted `Operator`.
-#[allow(missing_debug_implementations)]
-pub struct MountReader {
-    operator: Operator,
-    rel: String,
-    meta: OnceCell<Metadata>,
-}
-
-impl MountReader {
-    fn new(operator: Operator, rel: String) -> Self {
-        Self {
-            operator,
-            rel,
-            meta: OnceCell::new(),
-        }
-    }
-
-    async fn metadata(&self) -> Result<Metadata> {
-        let meta = self
-            .meta
-            .get_or_try_init(|| self.operator.stat(&self.rel))
-            .await?;
-        Ok(meta.clone())
-    }
-}
-impl oio::Read for MountReader {
-    async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn ReadStreamDyn>)> {
-        let meta = self.metadata().await?;
-
-        let start = range.offset();
-        let end = range.size().map(|size| start + size);
-
-        let stream = MountReadStream {
-            operator: self.operator.clone(),
-            rel: self.rel.clone(),
-            offset: start,
-            end,
-        };
-
-        Ok((RpRead::new(meta), Box::new(stream)))
-    }
-
-    async fn read(&self, range: BytesRange) -> Result<(RpRead, Buffer)> {
-        let meta = self.metadata().await?;
-
-        let buf = self
-            .operator
-            .read_with(&self.rel)
-            .range(range.to_range())
-            .await
-            .map_err(|err| {
-                Error::new(ErrorKind::Unexpected, "mount reader: read failed")
-                    .with_operation("MountReader::read")
-                    .set_source(err)
-            })?;
-
-        Ok((RpRead::new(meta), buf))
-    }
-}
-
-struct MountReadStream {
-    operator: Operator,
-    rel: String,
-    offset: u64,
-    end: Option<u64>,
-}
-
-const BUFFER_SIZE: u64 = 4_000_000;
-
-impl oio::ReadStream for MountReadStream {
-    async fn read(&mut self) -> Result<Buffer> {
-        if let Some(end) = self.end {
-            if self.offset >= end {
-                return Ok(Buffer::new());
-            }
-        }
-
-        let want = self
-            .end
-            .map(|end| (end - self.offset).min(BUFFER_SIZE as u64))
-            .unwrap_or(BUFFER_SIZE as u64);
-
-        let range = self.offset..self.offset + want;
-        let buf = self.operator.read_with(&self.rel).range(range).await.map_err(|err| {
-            Error::new(ErrorKind::Unexpected, "mount reader: stream read failed")
-                .with_operation("MountReadStream::read")
-                .set_source(err)
-        })?;
-
-        self.offset += buf.len() as u64;
-
-        if (buf.len() as u64) < want {
-            self.end = Some(self.offset);
-        }
-
-        Ok(buf)
-    }
-}
-/// [`oio::Write`] implementation for a mounted path.
-///
-/// Like [`MountReader`], `MountWriter` is lazy: the mounted `Operator`'s
-/// actual `Writer` is only opened (via `Operator::writer`) on the first call
-/// to `write`, `close`, or `abort`, since opening a writer is itself async.
-#[allow(missing_debug_implementations)]
-pub struct MountWriter {
-    operator: Operator,
-    rel: String,
-    inner: Option<Writer>,
-}
-
-impl MountWriter {
-    fn new(operator: Operator, rel: String) -> Self {
-        Self {
-            operator,
-            rel,
-            inner: None,
-        }
-    }
-
-    async fn writer(&mut self) -> Result<&mut Writer> {
-        if self.inner.is_none() {
-            let writer = self.operator.writer(&self.rel).await?;
-            self.inner = Some(writer);
-        }
-
-        Ok(self.inner.as_mut().expect("just initialized above"))
-    }
-}
-
-impl oio::Write for MountWriter {
-    async fn write(&mut self, bs: Buffer) -> Result<()> {
-        self.writer().await?.write(bs).await
-    }
-
-    async fn close(&mut self) -> Result<Metadata> {
-        self.writer().await?.close().await
-    }
-
-    async fn abort(&mut self) -> Result<()> {
-        self.writer().await?.abort().await
-    }
-}
-
-pub enum MountLister {
-    Real {
-        operator: Operator,
-        rel: String,
-        mount_path: String,
-        /// Lazily opened on the first call to `next`, since
-        /// `Operator::lister` is async.
-        inner: Option<Lister>,
-    },
-    Virtual {
-        entries: Vec<oio::Entry>,
-    },
-}
-
-impl Debug for MountLister {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            MountLister::Real {
-                mount_path, inner, ..
-            } => f
-                .debug_struct("Real")
-                .field("mount_path", mount_path)
-                .field("opened", &inner.is_some())
-                .finish(),
-
-            MountLister::Virtual { entries } => {
-                f.debug_struct("Virtual").field("entries", entries).finish()
-            }
-        }
-    }
-}
-
-impl oio::List for MountLister {
-    async fn next(&mut self) -> Result<Option<oio::Entry>> {
-        match self {
-            MountLister::Real {
-                operator,
-                rel,
-                mount_path,
-                inner,
-            } => {
-                if inner.is_none() {
-                    *inner = Some(operator.lister(rel).await?);
-                }
-
-                let lister = inner.as_mut().expect("just initialized above");
-
-                match lister.next().await {
-                    Some(Ok(entry)) => {
-                        let rebased = format!(
-                            "{}/{}",
-                            mount_path.trim_end_matches('/'),
-                            entry.path().trim_start_matches('/')
-                        );
-
-                        Ok(Some(oio::Entry::new(&rebased, entry.metadata().clone())))
-                    }
-                    Some(Err(e)) => Err(e),
-                    None => Ok(None),
-                }
-            }
-
-            MountLister::Virtual { entries } => Ok(entries.pop()),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct MountDeleter {
-    mounts: Arc<BTreeMap<String, Mount>>,
-}
-
-impl oio::Delete for MountDeleter {
-    async fn delete(&mut self, path: &str, _args: OpDelete) -> Result<()> {
-        match resolve(&self.mounts, path) {
-            Some((_, mount, rel)) => {
-                if mount.read_only {
-                    return Err(permission_denied(path));
-                }
-
-                mount.operator.delete(&rel).await
-            }
-            None => Err(not_found(path)),
-        }
-    }
-
-    async fn close(&mut self) -> Result<()> {
-        Ok(())
+        async { Err(util::unsupported("presign")) }
     }
 }
 
@@ -704,22 +409,20 @@ impl oio::Delete for MountDeleter {
 #[allow(unused_results)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use opendal_core::services::Memory;
+    use std::sync::Arc;
 
     fn builder() -> VfsBuilder {
         VfsBuilder::new(Arc::new(MemoryTracker::default()))
     }
 
     fn memory() -> Operator {
-        Operator::new(Memory::default())
-            .unwrap()
+        Operator::new(Memory::default()).unwrap()
     }
 
     #[tokio::test]
     async fn write_and_read_inside_a_mount_rebases_the_path() {
-        let op = Operator::new(builder().mount("/repos/test", memory()))
-            .unwrap();
+        let op = Operator::new(builder().mount("/repos/test", memory())).unwrap();
 
         op.write("/repos/test/abc.txt", "hello").await.unwrap();
 
@@ -729,8 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_dir_rebases_the_path() {
-        let op = Operator::new(builder().mount("/repos/test", memory()))
-            .unwrap();
+        let op = Operator::new(builder().mount("/repos/test", memory())).unwrap();
 
         op.create_dir("/repos/test/abc/").await.unwrap();
 
@@ -740,8 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn path_outside_any_mount_is_not_found() {
-        let op = Operator::new(builder().mount("/repos/test", memory()))
-            .unwrap();
+        let op = Operator::new(builder().mount("/repos/test", memory())).unwrap();
 
         let err = op.write("/elsewhere/file.txt", "x").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -755,7 +456,7 @@ mod tests {
                 .mount("/repos/other", memory())
                 .mount("/images", memory()),
         )
-            .unwrap();
+        .unwrap();
 
         let mut names: Vec<String> = op
             .list("/")
@@ -782,8 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn listing_inside_a_mount_delegates_and_rebases_entries() {
-        let op = Operator::new(builder().mount("/repos/test", memory()))
-            .unwrap();
+        let op = Operator::new(builder().mount("/repos/test", memory())).unwrap();
 
         op.write("/repos/test/a.txt", "1").await.unwrap();
         op.write("/repos/test/b.txt", "2").await.unwrap();
@@ -803,8 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_mount_rejects_writes_but_allows_reads() {
-        let op = Operator::new(builder().mount("/repos/test", memory()).read_only())
-            .unwrap();
+        let op = Operator::new(builder().mount("/repos/test", memory()).read_only()).unwrap();
 
         let err = op.write("/repos/test/a.txt", "x").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
@@ -822,7 +521,7 @@ mod tests {
                 .quota("", 10)
                 .mount("/scratch", memory()),
         )
-            .unwrap();
+        .unwrap();
 
         op.write("/repos/test/a.txt", "0123456789").await.unwrap();
 
@@ -841,7 +540,7 @@ mod tests {
                 .mount("/repos/test", memory())
                 .mount("/scratch", memory()),
         )
-            .unwrap();
+        .unwrap();
 
         op.write("/repos/test/a.txt", "x").await.unwrap();
         op.write("/scratch/b.txt", "y").await.unwrap();

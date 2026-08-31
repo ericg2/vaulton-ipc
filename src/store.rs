@@ -5,7 +5,6 @@ use crate::core::{VfsError, VfsResult, VfsUser};
 use crate::db::DbManager;
 use crate::ipc::job_event::Data;
 use crate::progress::RusticProgressBars;
-use crate::vfs::VfsBuilder;
 use async_trait::async_trait;
 use crossbeam_channel::Sender;
 use moka::sync::Cache;
@@ -21,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+use crate::vfs::VfsBuilder;
 
 pub type RepoNoIndex = Repository<OpenStatus>;
 pub type RepoIndexed = Repository<IndexedFullStatus>;
