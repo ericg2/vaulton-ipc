@@ -4207,7 +4207,7 @@ dependencies = [
 [[package]]
 name = "rustic_backend"
 version = "0.7.0"
-source = "git+https://github.com/ericg2/rustic_core.git#e50b08cf886a5dbaca108c903535c40bd8b385ea"
+source = "git+https://github.com/ericg2/rustic_core.git#357c3eb3a6895d8c40a7cef9615089bc2a6546fb"
 dependencies = [
  "aho-corasick",
  "backon",
@@ -4254,7 +4254,7 @@ checksum = "fbcebf2228827bc4b61cb54dfd84cf43aacf06ca2dfe4c014b136a0e32b876e2"
 [[package]]
 name = "rustic_core"
 version = "0.13.0"
-source = "git+https://github.com/ericg2/rustic_core.git#e50b08cf886a5dbaca108c903535c40bd8b385ea"
+source = "git+https://github.com/ericg2/rustic_core.git#357c3eb3a6895d8c40a7cef9615089bc2a6546fb"
 dependencies = [
  "aes256ctr_poly1305aes",
  "aho-corasick",
@@ -5590,9 +5590,9 @@ dependencies = [
 
 [[package]]
 name = "value-bag"
-version = "1.14.0"
+version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11d4788a546b899f8656382fe210e0c478fe3d2dcd6263d50cb6cc268240de6c"
+checksum = "068e763e8279de7ab94b6afebded2cb701678af094feb1c12ccb061b4783c1be"
 
 [[package]]
 name = "vcpkg"
