@@ -1,37 +1,13 @@
-[package]
-name = "rustic_ipc"
-version = "2.0.0"
+[workspace]
+members = [
+    "crates/ipc",
+    "crates/opendal-vfs",
+]
+resolver = "3"
+
+[workspace.package]
 edition = "2024"
+rust-version = "1.98.0"
 
-[dependencies]
-uuid = "1.23"
-itertools = "0.15"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = { version = "0.4", features = ["serde"] }
-base64 = "0.22"
-thiserror = "2"
-moka = { version = "0.12", features = ["future", "sync"] }
-crossbeam-channel = "0.5.15"
-log = "0.4"
-simplelog = "0.12.2"
-argon2 = "0.5.3"
-sha2 = "0.11.0"
-tokio = { version = "1.52", features = ["full"] }
-tonic = "0.14"
-tonic-prost = "0.14"
-prost = "0.14"
-prost-types = "0.14"
-bytes = "1.12"
+[workspace.dependencies]
 
-rustic_backend = { git = "https://github.com/ericg2/rustic_core.git" }
-rustic_core = { git = "https://github.com/ericg2/rustic_core.git" }
-opendal-core = "0.58.2"
-
-async-trait = "0.1.89"
-dashmap = "6.2.1"
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "sqlite-bundled"] }
-futures-lite = "2.6.1"
-
-[build-dependencies]
-tonic-prost-build = "0.14"

@@ -1,21 +1,14 @@
-use crate::vfs::sys::Mount;
+mod reader;
+mod lister;
+mod deleter;
+mod writer;
+
+pub mod layers;
+
 use std::collections::BTreeMap;
-use opendal_core::{Error, ErrorKind};
 
-pub fn not_found(path: &str) -> Error {
-    Error::new(ErrorKind::NotFound, "no mount covers this path").with_context("path", path)
-}
-
-pub fn permission_denied(path: &str) -> Error {
-    Error::new(ErrorKind::PermissionDenied, "mount is read-only").with_context("path", path)
-}
-
-pub fn unsupported(op: &'static str) -> Error {
-    Error::new(
-        ErrorKind::Unsupported,
-        format!("MountFs does not support `{op}`."),
-    )
-}
+pub use opendal_core::{Error, ErrorKind};
+use crate::layers::vfs::Mount;
 
 pub fn normalize(path: &str) -> String {
     let trimmed = path.trim_matches('/');
@@ -30,7 +23,7 @@ pub fn normalize(path: &str) -> String {
 /// that mount's root. "Owns" means `path` equals the mount path or is nested
 /// under it. If multiple configured mounts could match, the longest
 /// (most specific) one wins.
-pub fn resolve<'a>(
+pub fn resolve_path<'a>(
     mounts: &'a BTreeMap<String, Mount>,
     path: &str,
 ) -> Option<(&'a str, &'a Mount, String)> {

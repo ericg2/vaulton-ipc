@@ -2,11 +2,9 @@
 
 use crossbeam_channel as chan;
 use dashmap::DashMap;
-use opendal_core::Buffer;
-use prost_types::Timestamp;
-use rustic_backend::opendal::{OpenDALConfig, OpenDALSource};
-use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use opendal_core::{Buffer, Operator};
+use rustic_backend::opendal::OpenDALSource;
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tonic::{Request, Response, Status};
@@ -16,11 +14,11 @@ use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
 use crate::ipc::job_event::Data;
 use crate::ipc::vfs_point::Src as ProtoSrc;
 use crate::ipc::{
-    AppendVfsArgs, BackupArgs, CancelArgs, CheckArgs, Empty, ForgetArgs, GetSnapshotArgs,
+    BackupArgs, CancelArgs, CheckArgs, Empty, FilePath, ForgetArgs, GetSnapshotArgs,
     JobCancelResponse, JobEvent, JobFinishedEvent, JobNewMessageEvent, JobStartResponse,
-    ListVfsArgs, ListVfsResponse, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse,
-    RepoSource as ProtoRepoSource, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, Summary,
-    TouchVfsArgs, VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteVfsArgs,
+    ListVfsResponse, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse, RestoreArgs, SetVfsArgs,
+    Snapshot, SnapshotResponse, Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint,
+    VfsUser as ProtoVfsUser, WriteVfsArgs,
 };
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
@@ -29,165 +27,12 @@ use rustic_core::{
     StringList,
 };
 
-use crate::core::{UserSystem, VfsError, VfsPoint, VfsUser};
-use crate::store::{RepoSource, StorageSystem};
+use crate::core::{UserSystem, VfsPoint, VfsUser};
+use crate::store::StorageSystem;
+use crate::utils;
+use crate::utils::{fix_path, map_dal, map_vfs};
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
-
-fn internal(e: impl std::fmt::Display) -> Status {
-    Status::internal(e.to_string())
-}
-
-fn invalid(msg: impl Into<String>) -> Status {
-    Status::invalid_argument(msg.into())
-}
-
-fn not_found(msg: impl Into<String>) -> Status {
-    Status::not_found(msg.into())
-}
-
-fn map_vfs(e: VfsError) -> Status {
-    match e {
-        VfsError::UserNotFound => not_found("user not found"),
-        e => internal(e),
-    }
-}
-
-fn map_dal(e: opendal_core::Error) -> Status {
-    match e.kind() {
-        opendal_core::ErrorKind::NotFound => not_found(e.to_string()),
-        opendal_core::ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
-        _ => internal(e),
-    }
-}
-
-// ── Timestamp helpers ─────────────────────────────────────────────────────────
-
-fn to_ts(dt: Zoned) -> Timestamp {
-    Timestamp {
-        seconds: dt.timestamp().as_second(),
-        nanos: dt.timestamp().subsec_nanosecond(),
-    }
-}
-
-fn opt_ts(dt: Option<Zoned>) -> Option<Timestamp> {
-    dt.map(to_ts)
-}
-
-// ── Domain conversions ────────────────────────────────────────────────────────
-
-/// Converts a [`Path`] into an OpenDAL-supported [`String`].
-///
-/// # Arguments
-/// * `base` - The root [`Path`] to use.
-/// * `p` - The [`Path`] to convert from.
-/// * `is_dir` - If representing a directory or file.
-///
-/// # Returns
-/// A valid [`String`] for OpenDAL use.
-pub(crate) fn fix_path(p: impl AsRef<Path>, is_dir: bool) -> String {
-    let mut r = p.as_ref().to_string_lossy().to_string();
-    if !r.starts_with("/") {
-        r = format!("/{r}")
-    }
-    if is_dir && !r.ends_with("/") {
-        r += "/"
-    } else if !is_dir && r.ends_with("/") {
-        r = r.strip_suffix("/").unwrap_or(&r).to_string()
-    }
-    r.replace("\\", "/") // *** fix for windows-style directories
-}
-
-fn parse_repo_src(p: ProtoRepoSource) -> Result<RepoSource, Status> {
-    let src = p.src.ok_or(invalid("missing repo src"))?;
-    Ok(RepoSource {
-        scheme: src.scheme,
-        config: src.config.into_iter().collect(),
-        password: p.password,
-    })
-}
-
-fn require_repo_src(
-    opt: Option<ProtoRepoSource>,
-    field: &'static str,
-) -> Result<RepoSource, Status> {
-    parse_repo_src(opt.ok_or_else(|| invalid(format!("missing {field}")))?)
-}
-
-/// Resolves a `repo_name` against a loaded [`VfsUser`]'s mounted points,
-/// producing the [`RepoSource`] needed to open the repository.
-///
-/// Only points mounted with `is_repo = true` qualify; the point must also
-/// carry a `repo_password`, since that's required to open/decrypt it.
-fn resolve_repo_point(user: &VfsUser, repo_name: &str) -> Result<RepoSource, Status> {
-    let point = user
-        .points
-        .iter()
-        .find(|p| p.name == repo_name)
-        .ok_or_else(|| not_found(format!("repo point '{repo_name}' not found")))?;
-
-    if !point.is_repo {
-        return Err(invalid(format!(
-            "point '{repo_name}' is a data point, not a repo"
-        )));
-    }
-
-    let password = point
-        .repo_password
-        .clone()
-        .ok_or_else(|| invalid(format!("repo point '{repo_name}' is missing a password")))?;
-
-    Ok(RepoSource {
-        scheme: point.scheme.clone(),
-        config: point.config.clone().into_iter().collect(),
-        password,
-    })
-}
-
-/// Resolves a VFS-relative path (as exposed to VFS clients, e.g.
-/// `/points/<name>/sub/dir`) against a loaded [`VfsUser`]'s mounted points.
-///
-/// Returns the [`OpenDALConfig`] for the underlying data point plus the
-/// remaining path within that point. Only data points (`is_repo = false`)
-/// are supported for backup/restore — repo-mounted paths are intentionally
-/// rejected, since they're harder to parse reliably and more prone to
-/// changing shape.
-fn resolve_data_path(user: &VfsUser, vfs_path: &str) -> Result<(OpenDALConfig, PathBuf), Status> {
-    let trimmed = vfs_path.trim_start_matches('/');
-    let mut parts = trimmed.splitn(3, '/');
-
-    let root = parts.next().unwrap_or("");
-    if root != "points" {
-        return Err(invalid(format!(
-            "path '{vfs_path}' must be under /points/<name>/... (repo-mounted paths aren't supported for backup/restore)"
-        )));
-    }
-
-    let point_name = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| invalid(format!("path '{vfs_path}' is missing a point name")))?;
-    let rest = parts.next().unwrap_or("");
-
-    let point = user
-        .points
-        .iter()
-        .find(|p| p.name == point_name)
-        .ok_or_else(|| not_found(format!("data point '{point_name}' not found")))?;
-
-    if point.is_repo {
-        return Err(invalid(format!(
-            "point '{point_name}' is a repo, not a data point"
-        )));
-    }
-
-    let config = OpenDALConfig::default()
-        .scheme(point.scheme.clone())
-        .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
-
-    Ok((config, PathBuf::from(rest)))
-}
-
 impl TryFrom<ProtoVfsPoint> for VfsPoint {
     type Error = Status;
 
@@ -195,10 +40,10 @@ impl TryFrom<ProtoVfsPoint> for VfsPoint {
         let (scheme, config, is_repo, repo_password) = match p.src {
             Some(ProtoSrc::Data(ps)) => (ps.scheme, ps.config, false, None),
             Some(ProtoSrc::Repo(rs)) => match rs.src {
-                None => return Err(invalid("VfsPoint[repo].src is required")),
+                None => return Err(Status::invalid_argument("VfsPoint[repo].src is required")),
                 Some(x) => (x.scheme, x.config, true, Some(rs.password)),
             },
-            None => return Err(invalid("VfsPoint.src is required")),
+            None => return Err(Status::invalid_argument("VfsPoint.src is required")),
         };
 
         Ok(VfsPoint {
@@ -249,8 +94,8 @@ impl From<SnapshotSummary> for Summary {
             data_added_files_packed: s.data_added_files_packed,
             data_added_trees: s.data_added_trees,
             data_added_trees_packed: s.data_added_trees_packed,
-            backup_start: Some(to_ts(s.backup_start)),
-            backup_end: Some(to_ts(s.backup_end)),
+            backup_start: Some(utils::to_ts(s.backup_start)),
+            backup_end: Some(utils::to_ts(s.backup_end)),
         }
     }
 }
@@ -259,7 +104,7 @@ impl From<SnapshotFile> for Snapshot {
     fn from(s: SnapshotFile) -> Self {
         Snapshot {
             id: s.id.to_string(),
-            time: Some(to_ts(s.time)),
+            time: Some(utils::to_ts(s.time)),
             summary: s.summary.map(Into::into),
             tags: s.tags.iter().map(|t| t.to_string()).collect(),
             paths: s.paths.iter().map(|p| p.to_string()).collect(),
@@ -328,6 +173,22 @@ where
         }
     }
 
+    /// Attempts to resolve the [`Operator`] and path.
+    async fn get_operator(
+        &self,
+        user: &str,
+        path: &str,
+        is_dir: bool,
+    ) -> Result<(Operator, String), Status> {
+        let user = self.get_user(user).await?;
+        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
+        Ok((op, fix_path(path, is_dir)))
+    }
+
+    async fn get_user(&self, user: &str) -> Result<VfsUser, Status> {
+        self.inner.users.load_user(&user).await.map_err(map_vfs)
+    }
+
     /// Spawn a background job and return its ID immediately.
     ///
     /// The closure runs inside `spawn_blocking` so it may call blocking rustic
@@ -348,7 +209,6 @@ where
         let token = CancelToken::new();
         let (tx, rx) = chan::unbounded::<Data>();
         self.inner.jobs.insert(job_id, token.clone());
-
         {
             // Bridge thread — drains crossbeam channel into the async-safe
             // event buffer using std::Mutex, never touching the tokio runtime.
@@ -361,7 +221,6 @@ where
                 }
             });
         }
-
         {
             let inner = Arc::clone(&self.inner);
             tokio::task::spawn_blocking(move || {
@@ -372,7 +231,7 @@ where
                         job_id: job_id.to_string(),
                         priority: Priority::Error as i32,
                         message: e.to_string(),
-                        time: Some(to_ts(Zoned::now())),
+                        time: Some(utils::to_ts(Zoned::now())),
                     }));
                 }
 
@@ -380,7 +239,7 @@ where
                     job_id: job_id.to_string(),
                     success: result.is_ok(),
                     snapshot: result.ok().flatten(),
-                    time: Some(to_ts(Zoned::now())),
+                    time: Some(utils::to_ts(Zoned::now())),
                 }));
 
                 inner.jobs.remove(&job_id);
@@ -399,19 +258,12 @@ where
     S: StorageSystem,
     U: UserSystem,
 {
-    // ── Backup ────────────────────────────────────────────────────────────────
-
     async fn backup(&self, req: Request<BackupArgs>) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
+        let user = self.get_user(&args.user).await?;
 
-        let repo_src = resolve_repo_point(&user, &args.repo_name)?;
-        let (data_config, backup_path) = resolve_data_path(&user, &args.source_path)?;
+        let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
+        let (data_config, backup_path) = utils::resolve_data_path(&user, &args.source_path)?;
         let tags = args.tags;
         let storage = Arc::clone(&self.inner.storage);
 
@@ -434,22 +286,15 @@ where
         Ok(Response::new(JobStartResponse { job_id }))
     }
 
-    // ── Restore ───────────────────────────────────────────────────────────────
-
     async fn restore(
         &self,
         req: Request<RestoreArgs>,
     ) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
+        let user = self.get_user(&args.user).await?;
 
-        let repo_src = resolve_repo_point(&user, &args.repo_name)?;
-        let (dest_config, restore_path) = resolve_data_path(&user, &args.output_path)?;
+        let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
+        let (dest_config, restore_path) = utils::resolve_data_path(&user, &args.output_path)?;
         let snapshot_id = args.snapshot_id;
         let snapshot_path = args.snapshot_path;
         let delete = args.delete;
@@ -482,18 +327,11 @@ where
         Ok(Response::new(JobStartResponse { job_id }))
     }
 
-    // ── Check ─────────────────────────────────────────────────────────────────
-
     async fn check(&self, req: Request<CheckArgs>) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
+        let user = self.get_user(&args.user).await?;
 
-        let repo_src = resolve_repo_point(&user, &args.repo_name)?;
+        let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
         let storage = Arc::clone(&self.inner.storage);
 
         let job_id = self.spawn_job(move |job_id, tx, _token| {
@@ -506,25 +344,19 @@ where
         Ok(Response::new(JobStartResponse { job_id }))
     }
 
-    // ── Forget ────────────────────────────────────────────────────────────────
-
     async fn forget(&self, req: Request<ForgetArgs>) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
+        let user = self.get_user(&args.user).await?;
 
-        let repo_src = resolve_repo_point(&user, &args.repo_name)?;
+        let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
 
         let snap_ids: Vec<SnapshotId> = args
             .snapshots
             .iter()
             .map(|s| {
-                SnapshotId::from_str(s)
-                    .map_err(|e| invalid(format!("invalid snapshot id '{s}': {e}")))
+                SnapshotId::from_str(s).map_err(|e| {
+                    Status::invalid_argument(format!("invalid snapshot id '{s}': {e}"))
+                })
             })
             .collect::<Result<_, _>>()?;
 
@@ -540,21 +372,14 @@ where
         Ok(Response::new(JobStartResponse { job_id }))
     }
 
-    // ── GetSnapshots ──────────────────────────────────────────────────────────
-
     async fn get_snapshots(
         &self,
         req: Request<GetSnapshotArgs>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
+        let user = self.get_user(&args.user).await?;
 
-        let repo_src = resolve_repo_point(&user, &args.repo_src)?;
+        let repo_src = utils::resolve_repo_point(&user, &args.repo_src)?;
 
         // get_repo is async (spawn_blocking inside), so .await here is correct.
         // get_all_snapshots is blocking, so it gets its own spawn_blocking.
@@ -563,12 +388,12 @@ where
             .storage
             .get_repo(&repo_src)
             .await
-            .map_err(internal)?;
+            .map_err(|err| Status::internal(err.to_string()))?;
 
         let snaps = tokio::task::spawn_blocking(move || repo.get_all_snapshots())
             .await
-            .map_err(|e| internal(format!("task join: {e}")))?
-            .map_err(internal)?;
+            .map_err(|e| Status::internal(format!("task join: {e}")))?
+            .map_err(|err| Status::internal(err.to_string()))?;
 
         Ok(Response::new(SnapshotResponse {
             output: snaps.into_iter().map(Into::into).collect(),
@@ -582,8 +407,8 @@ where
         req: Request<CancelArgs>,
     ) -> Result<Response<JobCancelResponse>, Status> {
         let args = req.into_inner();
-        let uuid =
-            Uuid::parse_str(&args.job_id).map_err(|e| invalid(format!("bad job_id: {e}")))?;
+        let uuid = Uuid::parse_str(&args.job_id)
+            .map_err(|e| Status::invalid_argument(format!("bad job_id: {e}")))?;
 
         match self.inner.jobs.get(&uuid) {
             Some(token) => {
@@ -592,27 +417,23 @@ where
                     job_id: args.job_id,
                 }))
             }
-            None => Err(not_found(format!(
+            None => Err(Status::not_found(format!(
                 "job '{}' not found or already finished",
                 args.job_id
             ))),
         }
     }
 
-    // ── Poll ──────────────────────────────────────────────────────────────────
-
     async fn poll(&self, _: Request<Empty>) -> Result<Response<PollResponse>, Status> {
         let events = self
             .inner
             .events
             .lock()
-            .map_err(|e| internal(format!("event buffer lock poisoned: {e}")))?
+            .map_err(|e| Status::internal(format!("event buffer lock poisoned: {e}")))?
             .drain(..)
             .collect();
         Ok(Response::new(PollResponse { events }))
     }
-
-    // ── SetVfs ────────────────────────────────────────────────────────────────
 
     async fn set_vfs(&self, req: Request<SetVfsArgs>) -> Result<Response<Empty>, Status> {
         let users = req
@@ -626,45 +447,12 @@ where
         Ok(Response::new(Empty {}))
     }
 
-    // ── ListVfs ───────────────────────────────────────────────────────────────
-
-    async fn list_vfs(
+    async fn vfs_read_file(
         &self,
-        req: Request<ListVfsArgs>,
-    ) -> Result<Response<ListVfsResponse>, Status> {
-        let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
-        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
-        let path = fix_path(args.path, true);
-
-        let entries = op.list_with(&path).await.map_err(map_dal)?;
-
-        Ok(Response::new(ListVfsResponse {
-            nodes: entries.iter().map(entry_to_node).collect(),
-        }))
-    }
-
-    // ── ReadVfs ───────────────────────────────────────────────────────────────
-
-    async fn read_vfs(
-        &self,
-        req: Request<ReadVfsArgs>,
+        request: Request<ReadVfsArgs>,
     ) -> Result<Response<ReadVfsResponse>, Status> {
-        let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
-        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
-        let path = fix_path(args.path, false);
-
+        let args = request.into_inner();
+        let (op, path) = self.get_operator(&args.user, &args.path, false).await?;
         let buf = if args.length == 0 {
             op.read(&path).await.map_err(map_dal)?
         } else {
@@ -679,80 +467,111 @@ where
         }))
     }
 
-    // ── AppendVfs ─────────────────────────────────────────────────────────────
-
-    async fn append_vfs(&self, req: Request<AppendVfsArgs>) -> Result<Response<Empty>, Status> {
-        let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
-        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
-        let path = fix_path(args.path, false);
-
-        op.write_with(&path, args.data)
-            .append(true)
-            .await
-            .map_err(map_dal)?;
-
-        Ok(Response::new(Empty {}))
-    }
-
-    // ── WriteVfs ──────────────────────────────────────────────────────────────
-
-    async fn write_vfs(&self, req: Request<WriteVfsArgs>) -> Result<Response<Empty>, Status> {
-        let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
-
-        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
-        let path = fix_path(args.path, false);
-
-        if args.offset == 0 {
-            op.write(&path, args.data).await.map_err(map_dal)?;
-        } else {
-            // opendal has no native random-access write; fall back to
-            // read-splice-write. Consider a chunked backend for large files.
-            let mut body: Vec<u8> = op
-                .read(&path)
+    async fn vfs_write_file(
+        &self,
+        request: Request<WriteVfsArgs>,
+    ) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+        let (op, path) = self.get_operator(&args.user, &args.path, false).await?;
+        if args.append {
+            op.write_with(&path, args.data)
+                .append(true)
                 .await
-                .map_err(map_dal)?
-                .to_bytes()
-                .to_vec();
-
-            let start = args.offset as usize;
-            let end = start + args.data.len();
-            if body.len() < end {
-                body.resize(end, 0);
-            }
-            body[start..end].copy_from_slice(&args.data);
-
-            op.write(&path, body).await.map_err(map_dal)?;
+                .map_err(map_dal)?;
+        } else {
+            op.write(&path, args.data).await.map_err(map_dal)?;
         }
 
         Ok(Response::new(Empty {}))
     }
 
-    // ── TouchVfs ──────────────────────────────────────────────────────────────
-
-    async fn touch_vfs(&self, req: Request<TouchVfsArgs>) -> Result<Response<Empty>, Status> {
-        let args = req.into_inner();
-        let user = self
-            .inner
-            .users
-            .load_user(&args.user)
-            .await
-            .map_err(map_vfs)?;
-
-        let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
-        let path = fix_path(args.path, false);
+    async fn vfs_touch_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+        let (op, path) = self.get_operator(&args.user, &args.path, false).await?;
         op.write(&path, Buffer::new()).await.map_err(map_dal)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn vfs_list_dir(
+        &self,
+        request: Request<FilePath>,
+    ) -> Result<Response<ListVfsResponse>, Status> {
+        let args = request.into_inner();
+        let (op, path) = self.get_operator(&args.user, &args.path, true).await?;
+        let entries = op.list_with(&path).await.map_err(map_dal)?;
+
+        Ok(Response::new(ListVfsResponse {
+            nodes: entries.iter().map(entry_to_node).collect(),
+        }))
+    }
+
+    async fn vfs_create_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+        let (op, path) = self.get_operator(&args.user, &args.path, true).await?;
+        op.create_dir(&path).await.map_err(map_dal)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn vfs_remove_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+        let (op, path) = self.get_operator(&args.user, &args.path, false).await?;
+        op.delete_with(&path).await.map_err(map_dal)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn vfs_remove_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+        let (op, path) = self.get_operator(&args.user, &args.path, true).await?;
+        op.delete_with(&path)
+            .recursive(true)
+            .await
+            .map_err(map_dal)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn vfs_transfer(
+        &self,
+        request: Request<TransferArgs>,
+    ) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+        
+        let (src_op, src_path) = self
+            .get_operator(&args.old_user, &args.old_path, false)
+            .await?;
+        let (dst_op, dst_path) = self
+            .get_operator(&args.new_user, &args.new_path, false)
+            .await?;
+
+        // Two operators are "the same backend" if their scheme, root, and
+        // backend name all match. This is the closest thing OpenDAL exposes
+        // to identity/equality on `Operator`.
+        let src_info = src_op.info();
+        let dst_info = dst_op.info();
+        let same_backend = src_info.scheme() == dst_info.scheme()
+            && src_info.root() == dst_info.root()
+            && src_info.name() == dst_info.name();
+
+        if same_backend {
+            // Same backend: let OpenDAL do an intra-backend copy/rename,
+            // which is typically far cheaper than a read+write round trip
+            // (and atomic where the backend supports it).
+            if args.copy {
+                src_op.copy(&src_path, &dst_path).await.map_err(map_dal)?;
+            } else {
+                src_op.rename(&src_path, &dst_path).await.map_err(map_dal)?;
+            }
+        } else {
+            // Different backends (possibly different users/VFS roots entirely):
+            // no cross-backend copy/rename primitive exists, so stream the
+            // bytes through manually.
+            let buf = src_op.read(&src_path).await.map_err(map_dal)?;
+            dst_op.write(&dst_path, buf).await.map_err(map_dal)?;
+
+            if !args.copy {
+                src_op.delete(&src_path).await.map_err(map_dal)?;
+            }
+        }
+
         Ok(Response::new(Empty {}))
     }
 }

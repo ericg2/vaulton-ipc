@@ -3,33 +3,27 @@
 //! directories on a Unix box.
 //! ...
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::path::Path;
 use std::sync::Arc;
 
-use futures_lite::StreamExt;
 use log::debug;
-use tokio::sync::OnceCell;
 
-use crate::quota::{MemoryTracker, QuotaLayer, QuotaTracker};
-use crate::read_only::ReadOnlyLayer;
-use crate::vfs::deleter::MountDeleter;
-use crate::vfs::lister::MountLister;
-use crate::vfs::reader::MountReader;
-use crate::vfs::util;
-use crate::vfs::writer::MountWriter;
-use opendal_core::raw::oio::{OneShotCopier, ReadStreamDyn};
+use crate::layers::quota::*;
+use crate::layers::read_only::*;
+
+use crate::deleter::MountDeleter;
+use crate::lister::MountLister;
+use crate::reader::MountReader;
+use crate::writer::MountWriter;
+
+use opendal_core::raw::oio::OneShotCopier;
 use opendal_core::raw::*;
 use opendal_core::{
-    Buffer, Builder, BytesRange, Capability, EntryMode, Error, ErrorKind, Lister, Metadata,
-    OperationContext, Operator, Result, Writer,
+    Builder, Capability, EntryMode, Error, ErrorKind, Metadata, OperationContext, Operator, Result,
 };
-// ---------------------------------------------------------------------------
-// Builder internals
-// ---------------------------------------------------------------------------
 
 /// A not-yet-built mount, held inside [`VfsBuilder`].
 struct PendingMount {
@@ -143,7 +137,7 @@ impl VfsBuilder {
     /// configure the mount just added.
     pub fn mount(mut self, path: impl Into<String>, operator: Operator) -> Self {
         self.pending.push(PendingMount {
-            path: util::normalize(&path.into()),
+            path: crate::normalize(&path.into()),
             operator,
             read_only: false,
             quota: VfsQuota::Disabled,
@@ -183,18 +177,11 @@ pub struct Mount {
 
 /// True if `path` is a virtual ancestor directory of at least one mount.
 fn virtual_children(mounts: &BTreeMap<String, Mount>, path: &str) -> Option<Vec<String>> {
-    let normalized = util::normalize(path);
-
-    let prefix = if normalized == "/" {
-        "/".to_string()
-    } else {
-        format!("{normalized}/")
-    };
-
-    let mut children = std::collections::BTreeSet::new();
+    let normalized = crate::normalize(path);
+    let mut children = BTreeSet::new();
 
     for mount_path in mounts.keys() {
-        let Some(rest) = mount_path.strip_prefix(&prefix) else {
+        let Some(rest) = mount_path.strip_prefix(&normalized) else {
             continue;
         };
 
@@ -222,29 +209,27 @@ pub struct MountAccess {
     mounts: Arc<BTreeMap<String, Mount>>,
 }
 
-impl MountAccess {
-    async fn metadata(&self, path: &str) -> Result<Metadata> {
-        if let Some((mount_path, mount, rel)) = util::resolve(&self.mounts, path) {
-            if util::normalize(path) == mount_path && rel.is_empty() {
-                return Ok(Metadata::new(EntryMode::DIR));
-            }
-
-            return mount.operator.stat(&rel).await;
-        }
-
-        if virtual_children(&self.mounts, path).is_some() {
-            return Ok(Metadata::new(EntryMode::DIR));
-        }
-
-        Err(util::not_found(path))
-    }
-}
-
 impl Debug for MountAccess {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("MountAccess")
             .field("mounts", &self.mounts.keys().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+impl MountAccess {
+    async fn metadata(&self, path: &str) -> Result<Metadata> {
+        if let Some((mount_path, mount, rel)) = crate::resolve_path(&self.mounts, path) {
+            if crate::normalize(path) == mount_path && rel.is_empty() {
+                Ok(Metadata::new(EntryMode::DIR))
+            } else {
+                mount.operator.stat(&rel).await
+            }
+        } else if virtual_children(&self.mounts, path).is_some() {
+            Ok(Metadata::new(EntryMode::DIR))
+        } else {
+            Err(Error::new(ErrorKind::NotFound, "path not found"))
+        }
     }
 }
 
@@ -279,16 +264,19 @@ impl Service for MountAccess {
         path: &str,
         _args: OpCreateDir,
     ) -> Result<RpCreateDir> {
-        match util::resolve(&self.mounts, path) {
+        match crate::resolve_path(&self.mounts, path) {
             Some((_, mount, rel)) => {
                 if mount.read_only {
-                    return Err(util::permission_denied(path));
+                    return Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        "mount is read only",
+                    ));
                 }
 
                 mount.operator.create_dir(&rel).await?;
                 Ok(RpCreateDir::default())
             }
-            None => Err(util::not_found(path)),
+            None => Err(Error::new(ErrorKind::NotFound, "path not found")),
         }
     }
 
@@ -304,8 +292,8 @@ impl Service for MountAccess {
     /// metadata) happens lazily, the first time [`oio::Read::read`] is
     /// called on the returned reader.
     fn read(&self, _ctx: &OperationContext, path: &str, _args: OpRead) -> Result<Self::Reader> {
-        let Some((_, mount, rel)) = util::resolve(&self.mounts, path) else {
-            return Err(util::not_found(path));
+        let Some((_, mount, rel)) = crate::resolve_path(&self.mounts, path) else {
+            return Err(Error::new(ErrorKind::NotFound, "path not found"));
         };
 
         let rdr = MountReader::new(mount.operator.clone(), rel);
@@ -318,11 +306,14 @@ impl Service for MountAccess {
     /// mount's `Operator::writer` is only opened lazily on the first call to
     /// [`oio::Write::write`]/`close`/`abort`.
     fn write(&self, _ctx: &OperationContext, path: &str, _args: OpWrite) -> Result<Self::Writer> {
-        let Some((_, mount, rel)) = util::resolve(&self.mounts, path) else {
-            return Err(util::not_found(path));
+        let Some((_, mount, rel)) = crate::resolve_path(&self.mounts, path) else {
+            return Err(Error::new(ErrorKind::NotFound, "path not found"));
         };
         if mount.read_only {
-            return Err(util::permission_denied(path));
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "mount is read only",
+            ));
         }
         Ok(MountWriter::new(mount.operator.clone(), rel))
     }
@@ -339,7 +330,7 @@ impl Service for MountAccess {
     /// directory, the synthetic child entries are built up front since no
     /// I/O is required for those.
     fn list(&self, _ctx: &OperationContext, path: &str, _args: OpList) -> Result<Self::Lister> {
-        if let Some((mount_path, mount, rel)) = util::resolve(&self.mounts, path) {
+        if let Some((mount_path, mount, rel)) = crate::resolve_path(&self.mounts, path) {
             debug!("LIST {path} to {}", &rel);
 
             return Ok(MountLister::Real {
@@ -352,7 +343,7 @@ impl Service for MountAccess {
 
         match virtual_children(&self.mounts, path) {
             Some(children) => {
-                let base = util::normalize(path);
+                let base = crate::normalize(path);
                 let entries = children
                     .into_iter()
                     .map(|name| {
@@ -368,7 +359,7 @@ impl Service for MountAccess {
 
                 Ok(MountLister::Virtual { entries })
             }
-            None => Err(util::not_found(path)),
+            None => Err(Error::new(ErrorKind::NotFound, "path not found")),
         }
     }
 
@@ -390,15 +381,18 @@ impl Service for MountAccess {
         _args: OpCopy,
         _opts: OpCopier,
     ) -> Result<Self::Copier> {
-        let Some((from_path, from_mount, from_rel)) = util::resolve(&self.mounts, from) else {
-            return Err(util::not_found(from));
+        let Some((from_path, from_mount, from_rel)) = crate::resolve_path(&self.mounts, from)
+        else {
+            return Err(Error::new(ErrorKind::NotFound, "path not found"));
         };
-        let Some((to_path, to_mount, to_rel)) = util::resolve(&self.mounts, to) else {
-            return Err(util::not_found(to));
+        let Some((to_path, to_mount, to_rel)) = crate::resolve_path(&self.mounts, to) else {
+            return Err(Error::new(ErrorKind::NotFound, "path not found"));
         };
-
         if to_mount.read_only {
-            return Err(util::permission_denied(to));
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "mount is read only",
+            ));
         }
 
         // Only delegate to the backend's native `copy` when both paths land
@@ -447,18 +441,19 @@ impl Service for MountAccess {
         let to = to.to_string();
 
         async move {
-            let Some((from_path, from_mount, from_rel)) = util::resolve(&mounts, &from) else {
-                return Err(util::not_found(&from));
+            let Some((from_path, from_mount, from_rel)) = crate::resolve_path(&mounts, &from)
+            else {
+                return Err(Error::new(ErrorKind::NotFound, "path not found"));
             };
-            let Some((to_path, to_mount, to_rel)) = util::resolve(&mounts, &to) else {
-                return Err(util::not_found(&to));
+            let Some((to_path, to_mount, to_rel)) = crate::resolve_path(&mounts, &to) else {
+                return Err(Error::new(ErrorKind::NotFound, "path not found"));
             };
 
-            if from_mount.read_only {
-                return Err(util::permission_denied(&from));
-            }
-            if to_mount.read_only {
-                return Err(util::permission_denied(&to));
+            if from_mount.read_only || to_mount.read_only {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "mount is read only",
+                ));
             }
 
             let delegate = from_path == to_path && from_mount.operator.info().capability().rename;
@@ -480,7 +475,12 @@ impl Service for MountAccess {
         _path: &str,
         _args: OpPresign,
     ) -> impl Future<Output = Result<RpPresign>> + MaybeSend {
-        async { Err(util::unsupported("presign")) }
+        async {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "operation not supported",
+            ))
+        }
     }
 }
 

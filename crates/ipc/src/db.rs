@@ -1,11 +1,12 @@
 use crate::core::{UserSystem, VfsError, VfsPoint, VfsResult, VfsUser};
-use crate::quota::QuotaTracker;
 use async_trait::async_trait;
 use opendal_core::ErrorKind;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use std::path::Path;
 use std::str::FromStr;
+
+use opendal_vfs::layers::quota::*;
 
 /// SQLite-backed implementation of [`VfsStore`] and [`QuotaTracker`].
 ///

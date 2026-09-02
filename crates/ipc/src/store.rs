@@ -19,9 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
-use rustic_backend::local::LocalConfig;
 use uuid::Uuid;
-use crate::vfs::VfsBuilder;
+use opendal_vfs::layers::vfs::VfsBuilder;
 
 pub type RepoNoIndex = Repository<OpenStatus>;
 pub type RepoIndexed = Repository<IndexedFullStatus>;

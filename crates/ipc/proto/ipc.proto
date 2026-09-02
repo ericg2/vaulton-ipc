@@ -1,5 +1,6 @@
 syntax = "proto3";
 package ipc;
+
 import "google/protobuf/timestamp.proto";
 
 message RepoSource {
@@ -205,11 +206,6 @@ message SetVfsArgs {
   repeated VfsUser users = 1;
 }
 
-message ListVfsArgs {
-  string user = 1;
-  string path = 2;
-}
-
 message ListVfsResponse {
   repeated VfsNode nodes = 1;
 }
@@ -225,28 +221,24 @@ message ReadVfsResponse {
   bytes data = 1;
 }
 
-message AppendVfsArgs {
-  string user = 1;
-  string path = 2;
-  bytes data = 3;
-}
-
 message WriteVfsArgs {
   string user = 1;
   string path = 2;
   bytes data = 3;
-  uint64 offset = 4;
+  bool append = 4;
 }
 
-message TouchVfsArgs {
+message FilePath {
   string user = 1;
   string path = 2;
-  bool is_dir = 3;
 }
 
-message InfoVfsArgs {
-  string user = 1;
-  string path = 2;
+message TransferArgs {
+  string old_user = 1;
+  string old_path = 2;
+  string new_user = 3;
+  string new_path = 4;
+  bool copy = 5;
 }
 
 message Empty {}
@@ -260,9 +252,15 @@ service IpcService {
   rpc CancelJob(CancelArgs) returns (JobCancelResponse);
   rpc Poll(Empty) returns (PollResponse);
   rpc SetVfs(SetVfsArgs) returns (Empty);
-  rpc ListVfs(ListVfsArgs) returns (ListVfsResponse);
-  rpc ReadVfs(ReadVfsArgs) returns (ReadVfsResponse);
-  rpc AppendVfs(AppendVfsArgs) returns (Empty);
-  rpc WriteVfs(WriteVfsArgs) returns (Empty);
-  rpc TouchVfs(TouchVfsArgs) returns (Empty);
+
+  rpc Vfs_ReadFile(ReadVfsArgs) returns (ReadVfsResponse);
+  rpc Vfs_WriteFile(WriteVfsArgs) returns (Empty);
+  rpc Vfs_TouchFile(FilePath) returns (Empty);
+
+  rpc Vfs_ListDir(FilePath) returns (ListVfsResponse);
+  rpc Vfs_CreateDir(FilePath) returns (Empty);
+  rpc Vfs_RemoveFile(FilePath) returns (Empty);
+  rpc Vfs_RemoveDir(FilePath) returns (Empty);
+
+  rpc Vfs_Transfer(TransferArgs) returns (Empty);
 }
