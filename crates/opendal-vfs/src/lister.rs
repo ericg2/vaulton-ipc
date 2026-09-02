@@ -50,18 +50,30 @@ impl oio::List for MountLister {
                 }
 
                 let lister = inner.as_mut().expect("just initialized above");
-                match lister.next().await {
-                    Some(Ok(entry)) => {
-                        let rebased = format!(
-                            "{}/{}",
-                            mount_path.trim_end_matches('/'),
-                            entry.path().trim_start_matches('/')
-                        );
+                loop {
+                    match lister.next().await {
+                        Some(Ok(entry)) => {
+                            // Some backends (notably fs-based ones) yield the
+                            // queried directory itself as the first entry
+                            // when listing. Skip it — callers only want
+                            // children, not a self-referential entry.
+                            let entry_path = entry.path().trim_matches('/');
+                            let rel_trimmed = rel.trim_matches('/');
+                            if entry_path == rel_trimmed {
+                                continue;
+                            }
 
-                        Ok(Some(oio::Entry::new(&rebased, entry.metadata().clone())))
+                            let rebased = format!(
+                                "{}/{}",
+                                mount_path.trim_end_matches('/'),
+                                entry.path().trim_start_matches('/')
+                            );
+
+                            return Ok(Some(oio::Entry::new(&rebased, entry.metadata().clone())));
+                        }
+                        Some(Err(e)) => return Err(e),
+                        None => return Ok(None),
                     }
-                    Some(Err(e)) => Err(e),
-                    None => Ok(None),
                 }
             }
 

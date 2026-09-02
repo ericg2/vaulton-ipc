@@ -241,6 +241,14 @@ message TransferArgs {
   bool copy = 5;
 }
 
+message StatResponse {
+  VfsNode node = 1;
+}
+
+message ExistsResponse {
+  bool exists = 1;
+}
+
 message Empty {}
 
 service IpcService {
@@ -261,6 +269,9 @@ service IpcService {
   rpc Vfs_CreateDir(FilePath) returns (Empty);
   rpc Vfs_RemoveFile(FilePath) returns (Empty);
   rpc Vfs_RemoveDir(FilePath) returns (Empty);
+
+  rpc Vfs_Stat(FilePath) returns (StatResponse);
+  rpc Vfs_Exists(FilePath) returns (ExistsResponse);
 
   rpc Vfs_Transfer(TransferArgs) returns (Empty);
 }

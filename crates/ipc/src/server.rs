@@ -2,7 +2,7 @@
 
 use crossbeam_channel as chan;
 use dashmap::DashMap;
-use opendal_core::{Buffer, Operator};
+use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
 use rustic_backend::opendal::OpenDALSource;
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -14,11 +14,11 @@ use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
 use crate::ipc::job_event::Data;
 use crate::ipc::vfs_point::Src as ProtoSrc;
 use crate::ipc::{
-    BackupArgs, CancelArgs, CheckArgs, Empty, FilePath, ForgetArgs, GetSnapshotArgs,
-    JobCancelResponse, JobEvent, JobFinishedEvent, JobNewMessageEvent, JobStartResponse,
-    ListVfsResponse, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse, RestoreArgs, SetVfsArgs,
-    Snapshot, SnapshotResponse, Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint,
-    VfsUser as ProtoVfsUser, WriteVfsArgs,
+    BackupArgs, CancelArgs, CheckArgs, Empty, ExistsResponse, FilePath, ForgetArgs,
+    GetSnapshotArgs, JobCancelResponse, JobEvent, JobFinishedEvent, JobNewMessageEvent,
+    JobStartResponse, ListVfsResponse, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse,
+    RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs,
+    VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteVfsArgs,
 };
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
@@ -123,14 +123,24 @@ fn entry_to_node(entry: &opendal_core::Entry) -> VfsNode {
         .next()
         .unwrap_or(entry.path())
         .to_string();
-    let ts = None;
+    let mtime = meta.last_modified().map(chrono_to_ts);
     VfsNode {
         name,
         is_dir: meta.is_dir(),
         bytes: meta.content_length(),
-        ctime: ts.clone(),
-        mtime: ts.clone(),
-        atime: ts,
+        ctime: None,
+        mtime: mtime.clone(),
+        atime: None,
+    }
+}
+
+/// Convert opendal's `Timestamp` metadata (a `jiff::Timestamp` in this
+/// version of the crate) into a `prost_types::Timestamp`.
+fn chrono_to_ts(ts: opendal_core::raw::Timestamp) -> prost_types::Timestamp {
+    let inner = ts.into_inner();
+    prost_types::Timestamp {
+        seconds: inner.as_second(),
+        nanos: inner.subsec_nanosecond(),
     }
 }
 
@@ -198,12 +208,12 @@ where
     fn spawn_job<F>(&self, f: F) -> String
     where
         F: FnOnce(
-                Uuid,
-                chan::Sender<Data>,
-                CancelToken,
-            ) -> rustic_core::RusticResult<Option<String>>
-            + Send
-            + 'static,
+            Uuid,
+            chan::Sender<Data>,
+            CancelToken,
+        ) -> rustic_core::RusticResult<Option<String>>
+        + Send
+        + 'static,
     {
         let job_id = Uuid::new_v4();
         let token = CancelToken::new();
@@ -522,11 +532,74 @@ where
     async fn vfs_remove_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
         let (op, path) = self.get_operator(&args.user, &args.path, true).await?;
-        op.delete_with(&path)
-            .recursive(true)
-            .await
-            .map_err(map_dal)?;
+        op.delete_with(&path).recursive(true).await.map_err(map_dal)?;
         Ok(Response::new(Empty {}))
+    }
+
+    async fn vfs_stat(&self, request: Request<FilePath>) -> Result<Response<StatResponse>, Status> {
+        let args = request.into_inner();
+
+        // We don't know up front whether the path is a file or a directory,
+        // and `fix_path` normalizes each differently (trailing slash for
+        // dirs). Try the file form first since that's the common case, and
+        // fall back to the directory form on NotFound before giving up.
+        let (op, file_path) = self.get_operator(&args.user, &args.path, false).await?;
+
+        let meta = match op.stat(&file_path).await {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == DalErrorKind::NotFound => {
+                let dir_path = fix_path(&args.path, true);
+                op.stat(&dir_path).await.map_err(map_dal)?
+            }
+            Err(e) => return Err(map_dal(e)),
+        };
+
+        let name = args
+            .path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(&args.path)
+            .to_string();
+
+        let mtime = meta.last_modified().map(chrono_to_ts);
+
+        Ok(Response::new(StatResponse {
+            node: Some(VfsNode {
+                name,
+                is_dir: meta.is_dir(),
+                bytes: meta.content_length(),
+                ctime: None,
+                mtime,
+                atime: None,
+            }),
+        }))
+    }
+
+    async fn vfs_exists(
+        &self,
+        request: Request<FilePath>,
+    ) -> Result<Response<ExistsResponse>, Status> {
+        let args = request.into_inner();
+
+        // Same file-then-dir probing strategy as `vfs_stat`, since we don't
+        // know the path kind up front.
+        let (op, file_path) = self.get_operator(&args.user, &args.path, false).await?;
+
+        let exists = match op.stat(&file_path).await {
+            Ok(_) => true,
+            Err(e) if e.kind() == DalErrorKind::NotFound => {
+                let dir_path = fix_path(&args.path, true);
+                match op.stat(&dir_path).await {
+                    Ok(_) => true,
+                    Err(e2) if e2.kind() == DalErrorKind::NotFound => false,
+                    Err(e2) => return Err(map_dal(e2)),
+                }
+            }
+            Err(e) => return Err(map_dal(e)),
+        };
+
+        Ok(Response::new(ExistsResponse { exists }))
     }
 
     async fn vfs_transfer(
@@ -534,7 +607,7 @@ where
         request: Request<TransferArgs>,
     ) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
-        
+
         let (src_op, src_path) = self
             .get_operator(&args.old_user, &args.old_path, false)
             .await?;
@@ -544,7 +617,7 @@ where
 
         // Two operators are "the same backend" if their scheme, root, and
         // backend name all match. This is the closest thing OpenDAL exposes
-        // to identity/equality on `Operator`.
+        // to identity/equality on `Operator` (which doesn't impl PartialEq).
         let src_info = src_op.info();
         let dst_info = dst_op.info();
         let same_backend = src_info.scheme() == dst_info.scheme()
@@ -552,7 +625,7 @@ where
             && src_info.name() == dst_info.name();
 
         if same_backend {
-            // Same backend: let OpenDAL do an intra-backend copy/rename,
+            // Same backend: let opendal do an intra-backend copy/rename,
             // which is typically far cheaper than a read+write round trip
             // (and atomic where the backend supports it).
             if args.copy {
@@ -561,9 +634,9 @@ where
                 src_op.rename(&src_path, &dst_path).await.map_err(map_dal)?;
             }
         } else {
-            // Different backends (possibly different users/VFS roots entirely):
-            // no cross-backend copy/rename primitive exists, so stream the
-            // bytes through manually.
+            // Different backends: no cross-backend copy/rename primitive
+            // exists, so stream the bytes through manually. This only
+            // handles single files, not recursive directory trees.
             let buf = src_op.read(&src_path).await.map_err(map_dal)?;
             dst_op.write(&dst_path, buf).await.map_err(map_dal)?;
 

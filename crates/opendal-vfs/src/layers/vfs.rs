@@ -174,14 +174,21 @@ pub struct Mount {
     pub operator: Operator,
     pub read_only: bool,
 }
-
 /// True if `path` is a virtual ancestor directory of at least one mount.
 fn virtual_children(mounts: &BTreeMap<String, Mount>, path: &str) -> Option<Vec<String>> {
-    let normalized = crate::normalize(path);
+    // Ensure the prefix we strip always ends in '/', so that stripping it
+    // from a mount path never leaves a stray leading '/' in `rest` (which
+    // previously caused `rest.split('/').next()` to yield an empty string
+    // and pollute the children set with a phantom entry).
+    let mut prefix = crate::normalize(path);
+    if prefix != "/" && !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+
     let mut children = BTreeSet::new();
 
     for mount_path in mounts.keys() {
-        let Some(rest) = mount_path.strip_prefix(&normalized) else {
+        let Some(rest) = mount_path.strip_prefix(&prefix) else {
             continue;
         };
 
@@ -190,10 +197,12 @@ fn virtual_children(mounts: &BTreeMap<String, Mount>, path: &str) -> Option<Vec<
         }
 
         let next_segment = rest.split('/').next().unwrap_or(rest);
-        let _ = children.insert(next_segment.to_string());
+        if !next_segment.is_empty() {
+            let _ = children.insert(next_segment.to_string());
+        }
     }
 
-    if children.is_empty() && normalized != "/" {
+    if children.is_empty() && prefix != "/" {
         None
     } else {
         Some(children.into_iter().collect())
