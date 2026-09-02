@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use rustic_backend::local::LocalConfig;
 use uuid::Uuid;
 use crate::vfs::VfsBuilder;
 
@@ -183,7 +184,7 @@ impl StorageManager {
                     .repo_password
                     .clone()
                     .ok_or(VfsError::RepoPasswordMissing)?;
-
+                
                 let config = OpenDALConfig::default()
                     .scheme(point.scheme.clone())
                     .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
