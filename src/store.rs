@@ -188,6 +188,7 @@ impl StorageManager {
                 let config = OpenDALConfig::default()
                     .scheme(point.scheme.clone())
                     .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
+
                 let scheme = RusticVfsConfig {
                     options: RepositoryOptions::default(),
                     backend: BackendOptions::default().with_repo(&config),

@@ -1,5 +1,5 @@
-use crate::quota::QuotaTracker;
 use crate::core::{UserSystem, VfsError, VfsPoint, VfsResult, VfsUser};
+use crate::quota::QuotaTracker;
 use async_trait::async_trait;
 use opendal_core::ErrorKind;
 use sqlx::SqlitePool;
@@ -53,7 +53,6 @@ impl DbManager {
             r#"
             CREATE TABLE IF NOT EXISTS users (
                 username      TEXT PRIMARY KEY NOT NULL,
-                password_hash TEXT NOT NULL,
                 points        TEXT NOT NULL DEFAULT '[]'
             ) STRICT;
 
@@ -78,15 +77,13 @@ impl DbManager {
         let points_json = serde_json::to_string(&user.points)?;
         sqlx::query(
             r#"
-            INSERT INTO users (username, password_hash, points)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO users (username, points)
+            VALUES (?1, ?2)
             ON CONFLICT(username) DO UPDATE SET
-                password_hash = excluded.password_hash,
                 points        = excluded.points
             "#,
         )
         .bind(&user.username)
-        .bind(&user.password_hash)
         .bind(&points_json)
         .execute(&self.pool)
         .await?;
@@ -107,7 +104,7 @@ impl DbManager {
     /// Return every user in the database, ordered by username.
     pub async fn list_users(&self) -> VfsResult<Vec<VfsUser>> {
         let rows = sqlx::query_as::<_, UserRow>(
-            "SELECT username, password_hash, points FROM users ORDER BY username",
+            "SELECT username, points FROM users ORDER BY username",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -124,7 +121,7 @@ impl DbManager {
 impl UserSystem for DbManager {
     async fn load_user(&self, username: &str) -> VfsResult<VfsUser> {
         sqlx::query_as::<_, UserRow>(
-            "SELECT username, password_hash, points FROM users WHERE username = ?1",
+            "SELECT username, points FROM users WHERE username = ?1",
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -141,12 +138,11 @@ impl UserSystem for DbManager {
             let points_json = serde_json::to_string(&user.points)?;
             sqlx::query(
                 r#"
-                INSERT INTO users (username, password_hash, points)
-                VALUES (?1, ?2, ?3)
+                INSERT INTO users (username, points)
+                VALUES (?1, ?2)
                 "#,
             )
             .bind(&user.username)
-            .bind(&user.password_hash)
             .bind(&points_json)
             .execute(&mut *tx)
             .await?;
@@ -207,7 +203,6 @@ impl QuotaTracker for DbManager {
 #[derive(sqlx::FromRow)]
 struct UserRow {
     username: String,
-    password_hash: String,
     points: String, // JSON-encoded Vec<VfsPoint>
 }
 
@@ -218,7 +213,6 @@ impl TryFrom<UserRow> for VfsUser {
         let points: Vec<VfsPoint> = serde_json::from_str(&row.points)?;
         Ok(VfsUser {
             username: row.username,
-            password_hash: row.password_hash,
             points,
         })
     }
@@ -236,7 +230,6 @@ mod tests {
     fn dummy_user(name: &str) -> VfsUser {
         VfsUser {
             username: name.to_string(),
-            password_hash: "$argon2id$v=19$m=65536,t=3,p=4$placeholder".to_string(),
             points: vec![VfsPoint {
                 name: "primary".to_string(),
                 max_bytes: Some(1_073_741_824),
@@ -294,13 +287,11 @@ mod tests {
 
         let updated = VfsUser {
             username: "carol".to_string(),
-            password_hash: "$argon2id$v=19$new_hash".to_string(),
             points: vec![],
         };
         mgr.save_user(&updated).await.unwrap();
 
         let loaded = mgr.load_user("carol").await.unwrap();
-        assert_eq!(loaded.password_hash, "$argon2id$v=19$new_hash");
         assert!(loaded.points.is_empty());
     }
 

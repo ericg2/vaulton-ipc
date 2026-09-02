@@ -24,9 +24,7 @@ message VfsPoint {
 
 message VfsUser {
   string name = 1;
-  string password_hash = 2;
-  repeated string keys = 3;
-  repeated VfsPoint points = 4;
+  repeated VfsPoint points = 2;
 }
 
 enum Priority {
@@ -85,32 +83,38 @@ message Snapshot {
   string app_version = 6;
 }
 
+// Example: backup "/points/local/test/abcd" (a VFS path under one of the
+// user's mounted data points) to the repo point named "repo_name".
 message BackupArgs {
-  PointSource data_src = 2;
-  string backup_path = 3;
-  RepoSource repo_dest = 4;
-  optional DataFilter filter = 5;
-  repeated string tags = 6;
-  bool dry_run = 7;
+  string user = 1;
+  string source_path = 2;
+  string repo_name = 3;
+  optional DataFilter filter = 4;
+  repeated string tags = 5;
+  bool dry_run = 6;
 }
 
+// Example: restore "/" from repo point "repo_name", snapshot "xyz", to VFS
+// path "/points/local/test/abcdefg" (a mounted data point).
 message RestoreArgs {
-  RepoSource repo_src = 1;
-  string repo_path = 2;
-  PointSource data_dest = 3;
-  string data_path = 4;
-  string snapshot_id = 5;
+  string user = 1;
+  string repo_name = 2;
+  string snapshot_id = 3;
+  string snapshot_path = 4;
+  string output_path = 5; // the destination VFS data path
   bool delete = 6;
   bool dry_run = 7;
 }
 
 message CheckArgs {
-  RepoSource repo_src = 1;
+  string user = 1;
+  string repo_name = 2;
 }
 
 message ForgetArgs {
-  RepoSource repo_src = 1;
-  repeated string snapshots = 2;
+  string user = 1;
+  string repo_name = 2;
+  repeated string snapshots = 3;
 }
 
 message CancelArgs {
@@ -118,7 +122,8 @@ message CancelArgs {
 }
 
 message GetSnapshotArgs {
-  RepoSource repo_src = 1;
+  string user = 1;
+  string repo_src = 2;
 }
 
 ///////////////////////////////////////////////////////////////////

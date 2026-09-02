@@ -96,9 +96,6 @@ pub struct VfsUser {
     /// one shared [`QuotaTracker`] correctly isolates every user.
     pub username: String,
 
-    /// PHC-format password hash (e.g. `$argon2id$v=19$…`).
-    pub password_hash: String,
-
     /// Ordered mount points owned by this user.
     pub points: Vec<VfsPoint>,
 }
