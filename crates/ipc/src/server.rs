@@ -7,6 +7,7 @@ use rustic_backend::opendal::OpenDALSource;
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
+use log::warn;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -15,10 +16,18 @@ use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
 use crate::ipc::job_event::Data;
 use crate::ipc::vfs_path::Path;
 use crate::ipc::vfs_point::Src as ProtoSrc;
-use crate::ipc::{BackupArgs, CancelArgs, CheckArgs, Empty, ExistsResponse, FilePath, ForgetArgs, GetSnapshotArgs, InfoResponse, JobCancelResponse, JobEvent, JobFinishedEvent, JobNewMessageEvent, JobStartResponse, ListVfsResponse, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs, VfsNode, VfsPath, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteVfsArgs};
+use crate::ipc::{
+    BackupArgs, CancelArgs, CheckArgs, Empty, ExistsResponse, FilePath, ForgetArgs,
+    GetSnapshotArgs, InfoResponse, JobCancelResponse, JobEvent, JobFinishedEvent,
+    JobNewMessageEvent, JobStartResponse, ListVfsResponse, PointSource as ProtoPoint, PollResponse,
+    Priority, ReadVfsArgs, ReadVfsResponse, RepoSource as ProtoRepo, RestoreArgs, SetVfsArgs,
+    Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs, VfsNode, VfsPath,
+    VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteVfsArgs,
+};
 use crate::store::StorageSystem;
 use crate::utils;
 use crate::utils::{fix_path, map_dal, map_vfs};
+use opendal_vfs::layers::quota::QuotaTracker;
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
 use rustic_core::{
@@ -49,6 +58,31 @@ impl TryFrom<ProtoVfsPoint> for VfsPoint {
             is_repo,
             repo_password,
         })
+    }
+}
+
+impl From<&VfsPoint> for ProtoVfsPoint {
+    fn from(point: &VfsPoint) -> Self {
+        let p = ProtoPoint {
+            scheme: point.scheme.clone(),
+            config: point.config.clone().into_iter().collect(),
+        };
+
+        let src = if point.is_repo {
+            ProtoSrc::Repo(ProtoRepo {
+                src: Some(p),
+                password: point.repo_password.clone().unwrap_or_default(),
+            })
+        } else {
+            ProtoSrc::Data(p)
+        };
+
+        ProtoVfsPoint {
+            name: point.name.clone(),
+            max_bytes: point.max_bytes.unwrap_or(0),
+            can_write: !point.read_only,
+            src: Some(src),
+        }
     }
 }
 
@@ -153,37 +187,42 @@ fn chrono_to_ts(ts: opendal_core::raw::Timestamp) -> prost_types::Timestamp {
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
-struct Inner<S, U>
+struct Inner<S, U, Q>
 where
     S: StorageSystem,
     U: UserSystem,
+    Q: QuotaTracker,
 {
     storage: Arc<S>,
     users: Arc<U>,
+    quota: Arc<Q>,
     jobs: DashMap<Uuid, CancelToken>,
     events: StdMutex<VecDeque<JobEvent>>,
 }
 
 /// tonic service handle. Cheap to clone — all state lives behind `Arc`.
 #[derive(Clone)]
-pub struct GrpcServer<S, U>
+pub struct GrpcServer<S, U, Q>
 where
     S: StorageSystem,
     U: UserSystem,
+    Q: QuotaTracker,
 {
-    inner: Arc<Inner<S, U>>,
+    inner: Arc<Inner<S, U, Q>>,
 }
 
-impl<S, U> GrpcServer<S, U>
+impl<S, U, Q> GrpcServer<S, U, Q>
 where
     S: StorageSystem,
     U: UserSystem,
+    Q: QuotaTracker,
 {
-    pub fn new(storage: Arc<S>, users: Arc<U>) -> Self {
+    pub fn new(storage: Arc<S>, users: Arc<U>, quota: Arc<Q>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 storage,
                 users,
+                quota,
                 jobs: DashMap::new(),
                 events: StdMutex::new(VecDeque::new()),
             }),
@@ -273,10 +312,11 @@ where
 // ── IpcService ────────────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
-impl<S, U> IpcServiceTrait for GrpcServer<S, U>
+impl<S, U, Q> IpcServiceTrait for GrpcServer<S, U, Q>
 where
     S: StorageSystem,
     U: UserSystem,
+    Q: QuotaTracker,
 {
     async fn backup(&self, req: Request<BackupArgs>) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
@@ -463,7 +503,62 @@ where
             .map(VfsUser::try_from)
             .collect::<Result<Vec<_>, _>>()?;
 
+        let old_users = self.inner.users.get_users().await.map_err(map_vfs)?;
+        let mut changed_users = Vec::new();
+        let mut removed_quotas = Vec::new();
+
+        for old_user in &old_users {
+            let new_user = users.iter().find(|user| user.username == old_user.username);
+
+            match new_user {
+                Some(new_user) => {
+                    if new_user != old_user {
+                        changed_users.push(old_user.clone());
+
+                        // Find points that were removed from this user.
+                        for old_point in &old_user.points {
+                            let still_exists = new_user
+                                .points
+                                .iter()
+                                .any(|point| point.name == old_point.name);
+
+                            if !still_exists && !old_point.is_repo {
+                                removed_quotas
+                                    .push(format!("{}-{}", old_user.username, old_point.name));
+                            }
+                        }
+                    }
+                }
+
+                None => {
+                    // The entire user was removed.
+                    changed_users.push(old_user.clone());
+
+                    // Remove all quota state belonging to this user.
+                    for point in &old_user.points {
+                        if !point.is_repo {
+                            removed_quotas.push(format!("{}-{}", old_user.username, point.name));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update the database first. If this fails, don't invalidate caches or
+        // remove quota state.
         self.inner.users.set_users(users).await.map_err(map_vfs)?;
+
+        // Invalidate only users whose VFS configuration changed.
+        for user in changed_users {
+            warn!("Detected change on user: {}. Invalidating...", &user.username);
+            self.inner.storage.invalidate_vfs(&user);
+        }
+
+        // Remove quota state for points that were removed.
+        for id in removed_quotas {
+            self.inner.quota.clear(&id).await.map_err(|_|Status::internal("Failed to clear quota."))?;
+        }
+
         Ok(Response::new(Empty {}))
     }
 
@@ -661,6 +756,31 @@ where
     }
 
     async fn get_vfs(&self, _request: Request<Empty>) -> Result<Response<InfoResponse>, Status> {
-        todo!()
+        let users = self.inner.users.get_users().await.map_err(map_vfs)?;
+
+        let mut info = Vec::new();
+
+        for user in users {
+            for point in &user.points {
+                let used_bytes = if point.is_repo {
+                    // Repository VFS points are read-only and don't have a quota.
+                    0
+                } else {
+                    self.inner
+                        .quota
+                        .get_bytes_written(&format!("{}-{}", &user.username, &point.name))
+                        .await
+                        .map_err(|err| Status::internal(err.to_string()))?
+                };
+
+                info.push(crate::ipc::VfsInfo {
+                    user: user.username.clone(),
+                    point: Some(point.into()),
+                    used_bytes,
+                });
+            }
+        }
+
+        Ok(Response::new(InfoResponse { info }))
     }
 }

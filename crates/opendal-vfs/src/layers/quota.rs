@@ -143,6 +143,8 @@ pub trait QuotaTracker: Send + Sync + 'static {
     /// layer's optimistic fail-fast check, not for enforcement.
     async fn get_bytes_written(&self, id: &str) -> Result<u64>;
 
+    /// Clears the quota for a specific point. Used on deletion.
+    async fn clear(&self, id: &str) -> Result<()>;
 
     /// Atomically replace `old_size` bytes with `new_size` bytes in the
     /// running total for `id`, enforcing `limit` as part of the same
@@ -192,6 +194,9 @@ impl QuotaTracker for MemoryTracker {
         Ok(*self.0.lock().unwrap().get(id).unwrap_or(&0))
     }
 
+    async fn clear(&self, id: &str) -> Result<()> {
+        Err(Error::new(ErrorKind::Unsupported, "clearing not supported"))
+    }
 
     async fn apply_delta(
         &self,

@@ -56,6 +56,9 @@ pub trait StorageSystem: Send + Sync + 'static {
 
     /// Creates a VFS for the given user.
     async fn get_vfs(&self, user: &VfsUser) -> VfsResult<Operator>;
+
+    /// Removes the VFS instance for a user.
+    fn invalidate_vfs(&self, user: &VfsUser);
 }
 
 /// Identifies a rustic repository by its storage scheme and decryption
@@ -206,7 +209,7 @@ impl StorageManager {
                 if point.read_only {
                     vfs = vfs.read_only();
                 } else if let Some(max) = point.max_bytes {
-                    vfs = vfs.quota(&point.name, max);
+                    vfs = vfs.quota(format!("{}-{}", &user.username, &point.name), max);
                 }
             }
         }
@@ -265,5 +268,9 @@ impl StorageSystem for StorageManager {
         })
         .await
         .map_err(|e| VfsError::Internal(format!("spawn_blocking panicked: {e}")))?
+    }
+
+    fn invalidate_vfs(&self, user: &VfsUser) {
+        self.vfs_ops.invalidate(user);
     }
 }

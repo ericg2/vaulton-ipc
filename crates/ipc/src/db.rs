@@ -109,17 +109,6 @@ impl DbManager {
 
         Ok(())
     }
-
-    /// Return every user in the database, ordered by username.
-    pub async fn list_users(&self) -> VfsResult<Vec<VfsUser>> {
-        let rows = sqlx::query_as::<_, UserRow>(
-            "SELECT username, password, points FROM users ORDER BY username",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(VfsUser::try_from).collect()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +153,13 @@ impl UserSystem for DbManager {
     }
 
     async fn get_users(&self) -> VfsResult<Vec<VfsUser>> {
-        todo!()
+        let rows = sqlx::query_as::<_, UserRow>(
+            "SELECT username, password, points FROM users ORDER BY username",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(VfsUser::try_from).collect()
     }
 }
 
@@ -189,6 +184,16 @@ impl QuotaTracker for DbManager {
         Ok(row.map(|(b,)| b as u64).unwrap_or(0))
     }
 
+    async fn clear(&self, id: &str) -> opendal_core::Result<()> {
+        sqlx::query("DELETE FROM quota WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err("clear quota"))?;
+
+        Ok(())
+    }
+
     async fn apply_delta(
         &self,
         id: &str,
@@ -200,13 +205,26 @@ impl QuotaTracker for DbManager {
         // realistic byte counts, so the casts below are safe.
         let old_size = old_size as i64;
         let new_size = new_size as i64;
+
         // Clamp an effectively-infinite limit (e.g. deletes, which pass
         // u64::MAX) to i64::MAX so the comparison below stays valid SQL.
         let limit = limit.min(i64::MAX as u64) as i64;
 
-        let mut tx = self
+        // Acquire a connection and explicitly start an IMMEDIATE transaction.
+        //
+        // A normal `BEGIN` creates a deferred transaction: multiple
+        // concurrent callers can all begin successfully and then race when
+        // they attempt their first write. `BEGIN IMMEDIATE` acquires the
+        // SQLite RESERVED/write lock immediately, causing concurrent callers
+        // to wait rather than racing into SQLITE_BUSY errors.
+        let mut conn = self
             .pool
-            .begin()
+            .acquire()
+            .await
+            .map_err(db_err("acquire connection"))?;
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
             .await
             .map_err(db_err("begin transaction"))?;
 
@@ -216,16 +234,12 @@ impl QuotaTracker for DbManager {
             "INSERT INTO quota (id, bytes_written) VALUES (?1, 0) ON CONFLICT(id) DO NOTHING",
         )
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(db_err("initialize quota row"))?;
 
-        // The read (current bytes_written), the limit check, and the write
-        // all happen inside this single statement/transaction, so no other
-        // connection can observe an intermediate state: SQLite's writer
-        // lock (held for the lifetime of this transaction, in WAL mode)
-        // makes this atomic across concurrent callers, including other
-        // processes talking to the same database file.
+        // The read/check/write is performed as one atomic UPDATE while the
+        // IMMEDIATE transaction holds SQLite's writer lock.
         //
         // MAX(bytes_written - old_size, 0) mirrors the saturating_sub used
         // by MemoryTracker: the total is never allowed to go negative.
@@ -242,26 +256,31 @@ impl QuotaTracker for DbManager {
         .bind(old_size)
         .bind(new_size)
         .bind(limit)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(db_err("apply quota delta"))?;
 
         match row {
             Some((new_total,)) => {
-                tx.commit().await.map_err(db_err("commit quota delta"))?;
+                sqlx::query("COMMIT")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(db_err("commit quota delta"))?;
+
                 Ok(new_total as u64)
             }
+
             None => {
-                // WHERE clause didn't match: applying the delta would have
-                // exceeded `limit`. Roll back (no-op here since we haven't
-                // mutated bytes_written, but explicit for clarity) and
-                // report a quota error with the pre-transaction total for
-                // the message.
-                tx.rollback()
+                // The WHERE clause didn't match: applying the delta would
+                // have exceeded `limit`. Roll back the transaction so the
+                // quota value remains unchanged.
+                sqlx::query("ROLLBACK")
+                    .execute(&mut *conn)
                     .await
                     .map_err(db_err("rollback quota delta"))?;
 
                 let current = self.get_bytes_written(id).await?;
+
                 let hypothetical = current
                     .saturating_sub(old_size as u64)
                     .saturating_add(new_size as u64);
@@ -269,13 +288,14 @@ impl QuotaTracker for DbManager {
                 Err(opendal_core::Error::new(
                     ErrorKind::RateLimited,
                     format!(
-                        "write quota exceeded for '{id}': {current} used, {hypothetical} would be needed, {} limit",
+                        "write quota exceeded for '{id}': {current} used, \
+                             {hypothetical} would be needed, {} limit",
                         limit as u64
                     ),
                 )
-                    .with_context("quota_id", id.to_string())
-                    .with_context("quota_limit", limit.to_string())
-                    .with_context("quota_used", current.to_string()))
+                .with_context("quota_id", id.to_string())
+                .with_context("quota_limit", limit.to_string())
+                .with_context("quota_used", current.to_string()))
             }
         }
     }
@@ -416,7 +436,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(mgr.list_users().await.unwrap().len(), 3);
+        assert_eq!(mgr.get_users().await.unwrap().len(), 3);
     }
 
     // --- QuotaTracker ---
@@ -520,10 +540,11 @@ mod tests {
         let limit = 1_000u64;
 
         // 20 concurrent new-object writes of 100 bytes each against the
-        // same quota id. SQLite's writer lock (held across the whole
-        // transaction, WAL mode) serialises these, so exactly 10 should
-        // succeed and the rest should be rejected by the atomic UPDATE's
-        // WHERE clause — never more than `limit` committed.
+        // same quota id.
+        //
+        // BEGIN IMMEDIATE serialises the writers at transaction start,
+        // allowing exactly 10 operations to commit and causing the other
+        // 10 to be rejected by the atomic UPDATE's WHERE clause.
         let handles: Vec<_> = (0..20)
             .map(|_| {
                 let m = Arc::clone(&mgr);
@@ -532,6 +553,7 @@ mod tests {
             .collect();
 
         let mut succeeded = 0;
+
         for h in handles {
             if h.await.unwrap().is_ok() {
                 succeeded += 1;

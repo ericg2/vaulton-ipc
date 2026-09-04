@@ -39,7 +39,7 @@ async fn main() {
 
     let db = Arc::new(DbManager::open("poop.sqlite").await.unwrap());
     let store = Arc::new(StorageManager::new(db.clone(), TTL));
-    let serv = GrpcServer::new(store.clone(), db.clone());
+    let serv = GrpcServer::new(store.clone(), db.clone(), db.clone());
     let ftp = Arc::new(ftp::FtpServer::new(store.clone(), db.clone()));
 
     let ftp_server = libunftp::ServerBuilder::with_user_detail_provider(

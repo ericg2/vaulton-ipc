@@ -29,7 +29,7 @@ rustic_backend = { git = "https://github.com/ericg2/rustic_core.git" }
 rustic_core = { git = "https://github.com/ericg2/rustic_core.git" }
 opendal-vfs = { path = "../opendal-vfs" }
 
-unftp-sbe-opendal = "0.4.5"
+unftp-sbe-opendal = "=0.4.5"
 libunftp = { version = "0.23.0", features = ["aws_lc_rs"] }
 unftp-core = "0.1.0"
 

@@ -151,6 +151,23 @@ where
         self.backend(user).await?.list(user, path).await
     }
 
+    async fn get_into<'a, P, W: ?Sized>(
+        &self,
+        user: &VfsUser,
+        path: P,
+        start_pos: u64,
+        output: &'a mut W,
+    ) -> Result<u64>
+    where
+        P: AsRef<Path> + Send + Debug,
+        W: AsyncWrite + Unpin + Sync + Send,
+    {
+        self.backend(user)
+            .await?
+            .get_into(user, path, start_pos, output)
+            .await
+    }
+
     async fn get<P>(
         &self,
         user: &VfsUser,
@@ -163,28 +180,15 @@ where
         self.backend(user).await?.get(user, path, start_pos).await
     }
 
-    async fn get_into<'a, P, W: ?Sized>(
-        &self,
-        user: &VfsUser,
-        path: P,
-        start_pos: u64,
-        output: &'a mut W,
-    ) -> Result<u64>
-    where
-        P: AsRef<Path> + Send + Debug,
-        W: AsyncWrite + Unpin + Sync + Send,
-    {
-        self.backend(user).await?
-            .get_into(user, path, start_pos, output)
-            .await
-    }
-
     async fn put<P, R>(&self, user: &VfsUser, input: R, path: P, start_pos: u64) -> Result<u64>
     where
         P: AsRef<Path> + Send + Debug,
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
-        self.backend(user).await?.put(user, input, path, start_pos).await
+        self.backend(user)
+            .await?
+            .put(user, input, path, start_pos)
+            .await
     }
 
     async fn del<P>(&self, user: &VfsUser, path: P) -> Result<()>
