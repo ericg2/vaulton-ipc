@@ -2,19 +2,12 @@ use crate::db::DbManager;
 use crate::ipc::ipc_service_server::IpcServiceServer;
 use crate::server::GrpcServer;
 use crate::store::StorageManager;
-use chrono::{DateTime, Utc};
-use itertools::Itertools;
 use log::LevelFilter;
 use prost_types::Timestamp;
-use rustic_core::jiff::Zoned;
-use serde::{Deserialize, Serialize};
 use simplelog::{Config, SimpleLogger};
 use std::error::Error;
-use std::io::{BufRead, Write};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::{Handle, Runtime};
 use tonic::transport::Server;
 
 pub mod ipc {

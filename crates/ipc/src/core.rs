@@ -20,10 +20,9 @@
 //! user record in the store, call [`VfsManager::invalidate`] to drop the
 //! stale entry so the next call rebuilds from fresh data.
 
-use crate::store::StorageSystem;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::Formatter;
 use thiserror::Error;
 use unftp_core::auth::UserDetail;

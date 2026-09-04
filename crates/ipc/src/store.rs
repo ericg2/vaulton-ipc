@@ -18,11 +18,9 @@ use rustic_core::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncRead;
-use unftp_core::storage::{Fileinfo, Metadata, StorageBackend};
+use unftp_core::storage::StorageBackend;
 use uuid::Uuid;
 use opendal_vfs::layers::vfs::VfsBuilder;
 

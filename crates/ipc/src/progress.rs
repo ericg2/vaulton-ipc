@@ -1,11 +1,8 @@
 use crate::ipc::job_event::Data;
 use crate::ipc::{JobBarFinished, JobBarIncrement, JobBarLengthSet, JobBarTitleSet};
 use crate::proto_stamp;
-use chrono::Utc;
 use crossbeam_channel::Sender;
 use rustic_core::{Progress, ProgressBars, ProgressType, RusticProgress};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use rustic_core::jiff::Timestamp;
 use uuid::Uuid;
 

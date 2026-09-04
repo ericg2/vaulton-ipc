@@ -4,7 +4,7 @@ use opendal_vfs::{Error, ErrorKind};
 use prost_types::Timestamp;
 use rustic_backend::opendal::OpenDALConfig;
 use rustic_core::jiff::Zoned;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tonic::Status;
 
@@ -115,7 +115,7 @@ pub fn resolve_repo_point(user: &VfsUser, repo_name: &str) -> Result<RepoSource,
 pub fn resolve_data_point(
     user: &VfsUser,
     point_name: &str,
-    point_path: &str,
+    _point_path: &str,
 ) -> Result<OpenDALConfig, Status> {
     let point = user
         .points

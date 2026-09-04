@@ -2,7 +2,6 @@ use crate::core::{UserSystem, VfsUser};
 use crate::store::StorageSystem;
 
 use async_trait::async_trait;
-use opendal_core::Operator;
 
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};

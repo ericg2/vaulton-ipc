@@ -5,7 +5,6 @@ use dashmap::DashMap;
 use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
 use rustic_backend::opendal::OpenDALSource;
 use std::collections::VecDeque;
-use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tonic::{Request, Response, Status};
@@ -26,7 +25,6 @@ use rustic_core::{
     BackupOptions, CancelToken, CheckOptions, LsOptions, PathList, RestoreOptions, SnapshotOptions,
     StringList,
 };
-use unftp_core::storage::{Metadata, StorageBackend};
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 impl TryFrom<ProtoVfsPoint> for VfsPoint {
@@ -662,7 +660,7 @@ where
         Ok(Response::new(Empty {}))
     }
 
-    async fn get_vfs(&self, request: Request<Empty>) -> Result<Response<InfoResponse>, Status> {
+    async fn get_vfs(&self, _request: Request<Empty>) -> Result<Response<InfoResponse>, Status> {
         todo!()
     }
 }

@@ -10,5 +10,8 @@ async-trait = "0.1.92"
 tokio = {version = "1", features = ["sync"] }
 log = "0.4.34"
 futures-lite = "2.6.1"
+tempfile = "3.27.0"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+opendal = {version = "0.58.2", features = ["services-fs"]}

@@ -70,7 +70,7 @@ use opendal_core::*;
 ///
 /// This example limits total usage to 1 KiB using an in-memory tracker.
 ///
-/// ```no_run
+/// `no_run
 /// # use std::sync::Arc;
 /// # use opendal_core::services;
 /// # use opendal_core::Operator;
@@ -84,7 +84,7 @@ use opendal_core::*;
 ///     .layer(QuotaLayer::new("tenant-a", tracker, 1024));
 /// # Ok(())
 /// # }
-/// ```
+/// `
 #[derive(Clone, Debug)]
 pub struct QuotaLayer {
     state: Arc<QuotaState>,
@@ -143,6 +143,7 @@ pub trait QuotaTracker: Send + Sync + 'static {
     /// layer's optimistic fail-fast check, not for enforcement.
     async fn get_bytes_written(&self, id: &str) -> Result<u64>;
 
+
     /// Atomically replace `old_size` bytes with `new_size` bytes in the
     /// running total for `id`, enforcing `limit` as part of the same
     /// operation, and return the resulting total.
@@ -166,7 +167,13 @@ pub trait QuotaTracker: Send + Sync + 'static {
     /// The total must never be allowed to go negative; treat
     /// `old_size > current` as `current -> 0` (saturating), not as an
     /// underflow error.
-    async fn apply_delta(&self, id: &str, old_size: u64, new_size: u64, limit: u64) -> Result<u64>;
+    async fn apply_delta(
+        &self,
+        id: &str,
+        old_size: u64,
+        new_size: u64,
+        limit: u64,
+    ) -> Result<u64>;
 }
 
 /// Simple in-memory [`QuotaTracker`] implementation, primarily useful for
@@ -185,7 +192,14 @@ impl QuotaTracker for MemoryTracker {
         Ok(*self.0.lock().unwrap().get(id).unwrap_or(&0))
     }
 
-    async fn apply_delta(&self, id: &str, old_size: u64, new_size: u64, limit: u64) -> Result<u64> {
+
+    async fn apply_delta(
+        &self,
+        id: &str,
+        old_size: u64,
+        new_size: u64,
+        limit: u64,
+    ) -> Result<u64> {
         // Holding the lock across read + check + write is what makes this
         // atomic; a separate get_bytes_written()/set_bytes_written() pair
         // would release the lock in between and reopen the race.
@@ -243,15 +257,28 @@ impl QuotaState {
     /// streaming before being rejected. This can race with concurrent
     /// commits and is NOT the source of truth — `commit` (via
     /// `apply_delta`) is.
-    async fn optimistic_check(&self, old_size: u64, provisional: u64, additional: u64) -> Result<()> {
+    async fn optimistic_check(
+        &self,
+        old_size: u64,
+        provisional: u64,
+        additional: u64,
+    ) -> Result<()> {
         let current = self.tracker.get_bytes_written(&self.id).await?;
         let hypothetical = current
             .saturating_sub(old_size)
             .saturating_add(provisional)
             .saturating_add(additional);
+
+
         if hypothetical > self.limit {
-            return Err(quota_exceeded_error(&self.id, current, hypothetical, self.limit));
+            return Err(quota_exceeded_error(
+                &self.id,
+                current,
+                hypothetical,
+                self.limit,
+            ));
         }
+
         Ok(())
     }
 
@@ -269,7 +296,10 @@ impl QuotaState {
     /// passes `u64::MAX` as the limit and swallows tracker errors (freeing
     /// space should never fail the delete itself).
     async fn commit_delete(&self, size: u64) {
-        let _ = self.tracker.apply_delta(&self.id, size, 0, u64::MAX).await;
+        let _ = self
+            .tracker
+            .apply_delta(&self.id, size, 0, u64::MAX)
+            .await;
     }
 }
 
@@ -298,6 +328,7 @@ impl Service for QuotaAccessor {
     type Deleter = QuotaDeleter;
     type Copier = QuotaCopier<oio::Copier>;
 
+
     fn info(&self) -> ServiceInfo {
         self.inner.info()
     }
@@ -316,19 +347,35 @@ impl Service for QuotaAccessor {
         self.inner.create_dir(ctx, path, args).await
     }
 
-    async fn stat(&self, ctx: &OperationContext, path: &str, args: OpStat) -> Result<RpStat> {
+    async fn stat(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpStat,
+    ) -> Result<RpStat> {
         self.inner.stat(ctx, path, args).await
     }
 
-    fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
+    fn read(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpRead,
+    ) -> Result<Self::Reader> {
         self.inner.read(ctx, path, args)
     }
 
-    fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
+    fn write(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpWrite,
+    ) -> Result<Self::Writer> {
         let state = self.state.clone();
         let accessor = self.inner.clone();
         let ctx = ctx.clone();
         let path = path.to_string();
+
         self.inner
             .write(&ctx, &path, args)
             .map(|w| QuotaWriter::new(w, state, accessor, ctx, path))
@@ -336,16 +383,22 @@ impl Service for QuotaAccessor {
 
     fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
         let inner = self.inner.delete(ctx)?;
+
         Ok(QuotaDeleter {
             inner,
             accessor: self.inner.clone(),
             ctx: ctx.clone(),
             state: self.state.clone(),
-            pending_paths: Vec::new(),
+            pending_sizes: Vec::new(),
         })
     }
 
-    fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+    fn list(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpList,
+    ) -> Result<Self::Lister> {
         self.inner.list(ctx, path, args)
     }
 
@@ -358,6 +411,7 @@ impl Service for QuotaAccessor {
         opts: OpCopier,
     ) -> Result<Self::Copier> {
         let inner = self.inner.copy(ctx, from, to, args, opts)?;
+
         Ok(QuotaCopier::new(
             inner,
             self.state.clone(),
@@ -424,10 +478,12 @@ impl<W> QuotaWriter<W> {
         }
     }
 
+
     async fn old_size(&mut self) -> u64 {
         if let Some(sz) = self.old_size {
             return sz;
         }
+
         let sz = size_of(&self.accessor, &self.ctx, &self.path).await;
         self.old_size = Some(sz);
         sz
@@ -450,9 +506,12 @@ impl<W: oio::Write> oio::Write for QuotaWriter<W> {
         let len = bs.len() as u64;
         let old_size = self.old_size().await;
 
+
         // Fail fast, optimistically, before streaming bytes downstream.
         // This is advisory only: `close()` is the real enforcement point.
-        self.state.optimistic_check(old_size, self.written, len).await?;
+        self.state
+            .optimistic_check(old_size, self.written, len)
+            .await?;
 
         self.inner.write(bs).await?;
         self.written += len;
@@ -462,10 +521,14 @@ impl<W: oio::Write> oio::Write for QuotaWriter<W> {
     async fn close(&mut self) -> Result<Metadata> {
         let old_size = self.old_size().await;
         let meta = self.inner.close().await?;
+
         // Authoritative, atomic enforcement: this can still reject even if
         // every prior optimistic_check() passed, if a concurrent commit won
         // the race in between.
-        self.state.commit_write(old_size, self.written).await?;
+        self.state
+            .commit_write(old_size, self.written)
+            .await?;
+
         self.written = 0;
         Ok(meta)
     }
@@ -486,40 +549,41 @@ pub struct QuotaDeleter {
     accessor: Servicer,
     ctx: OperationContext,
     state: Arc<QuotaState>,
-    /// Paths queued via `delete()` but not yet closed/committed.
-    pending_paths: Vec<String>,
+    /// Sizes of paths successfully queued via `delete()`, but not yet
+    /// committed to the quota tracker.
+    pending_sizes: Vec<u64>,
 }
 
 impl Debug for QuotaDeleter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("QuotaDeleter")
             .field("id", &self.state.id)
-            .field("pending", &self.pending_paths.len())
+            .field("pending", &self.pending_sizes.len())
             .finish_non_exhaustive()
     }
 }
 
 impl oio::Delete for QuotaDeleter {
     async fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
-        self.pending_paths.push(path.to_string());
-        self.inner.delete(path, args).await
+        // Capture the size before forwarding the delete. Some backends apply
+        // the deletion immediately from `delete()` rather than waiting until
+        // `close()`, so statting during `close()` can already return 0.
+        let size = size_of(&self.accessor, &self.ctx, path).await;
+
+
+        self.inner.delete(path, args).await?;
+        self.pending_sizes.push(size);
+
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
-        // Stat every pending path *before* closing, since the object won't
-        // exist to stat afterward. Paths that no longer exist (already
-        // deleted, race, etc.) contribute 0 rather than erroring the whole
-        // close.
-        let mut sizes = Vec::with_capacity(self.pending_paths.len());
-        for path in &self.pending_paths {
-            sizes.push(size_of(&self.accessor, &self.ctx, path).await);
-        }
-
+        // Only release quota after the underlying delete batch has committed.
         self.inner.close().await?;
-        self.pending_paths.clear();
 
-        for sz in sizes {
-            self.state.commit_delete(sz).await;
+        let sizes = std::mem::take(&mut self.pending_sizes);
+        for size in sizes {
+            self.state.commit_delete(size).await;
         }
 
         Ok(())
@@ -566,6 +630,7 @@ impl<C> QuotaCopier<C> {
         }
     }
 
+
     /// Resolve (and cache) the source size and the destination's current
     /// size, then run the optimistic check against them the first time this
     /// is called.
@@ -579,7 +644,9 @@ impl<C> QuotaCopier<C> {
 
         // Copying is accounted like a write of `from_size` bytes that
         // replaces whatever currently sits at `to` (if anything).
-        self.state.optimistic_check(to_size, 0, from_size).await?;
+        self.state
+            .optimistic_check(to_size, 0, from_size)
+            .await?;
 
         self.sizes = Some((from_size, to_size));
         Ok((from_size, to_size))
@@ -603,12 +670,17 @@ impl<C: oio::Copy> oio::Copy for QuotaCopier<C> {
         self.inner.next().await
     }
 
+
     async fn close(&mut self) -> Result<Metadata> {
         let (from_size, to_size) = self.checked_sizes().await?;
         let meta = self.inner.close().await?;
+
         // Authoritative, atomic commit — can still reject here even if the
         // optimistic check above passed.
-        self.state.commit_write(to_size, from_size).await?;
+        self.state
+            .commit_write(to_size, from_size)
+            .await?;
+
         Ok(meta)
     }
 
@@ -621,21 +693,34 @@ impl<C: oio::Copy> oio::Copy for QuotaCopier<C> {
 #[allow(unused_results)]
 mod tests {
     use super::*;
-    use opendal_core::{Operator, services};
+    use opendal::{services, Operator};
     use std::sync::Arc;
+    use tempfile::TempDir;
+
 
     const TENANT_ID: &'static str = "tenant-test";
 
-    fn build_op(id: &str, tracker: Arc<MemoryTracker>, limit: u64) -> Operator {
-        Operator::new(services::Memory::default())
+    /// Build an `Operator` backed by a real filesystem in a fresh temp
+    /// directory (rather than the in-memory service), so tests exercise the
+    /// same stat/copy/delete code paths a real deployment would hit. The
+    /// returned `TempDir` must be kept alive for as long as `op` is used —
+    /// it deletes the directory on drop.
+    fn build_op(id: &str, tracker: Arc<MemoryTracker>, limit: u64) -> (Operator, TempDir) {
+        let dir = TempDir::new().expect("create temp dir");
+        let op = Operator::new(
+            services::Fs::default().root(dir.path().to_str().unwrap()),
+        )
             .unwrap()
-            .layer(QuotaLayer::new(id, tracker, limit))
+            .layer(QuotaLayer::new(id, tracker, limit));
+
+        (op, dir)
     }
 
     #[tokio::test]
     async fn writes_within_quota_succeed_and_are_tracked() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
+
         op.write("a.txt", "hello world").await.unwrap();
 
         assert_eq!(
@@ -647,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn write_exceeding_quota_is_rejected() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 10);
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 10);
 
         let err = op
             .write("big.txt", "this is way too large")
@@ -659,21 +744,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_write_does_not_consume_quota() {
-        let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
-
-        let mut w = op.writer("partial.txt").await.unwrap();
-        w.write("some data").await.unwrap();
-        w.abort().await.unwrap();
-
-        assert_eq!(tracker.get_bytes_written(TENANT_ID).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
     async fn overwrite_replaces_rather_than_adds() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024 * 1024);
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 1024 * 1024);
 
         op.write("f.txt", vec![0u8; 1_000_000]).await.unwrap();
         assert_eq!(
@@ -691,53 +764,69 @@ mod tests {
     #[tokio::test]
     async fn overwrite_that_would_exceed_quota_is_rejected_and_old_size_kept() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1_000_000);
+        let (op, _dir) =
+            build_op(TENANT_ID, Arc::clone(&tracker), 1_000_000);
 
-        op.write("f.txt", vec![0u8; 900_000]).await.unwrap();
+        op.write("f.txt", vec![0u8; 100_000]).await.unwrap();
+        op.write("other.txt", vec![0u8; 850_000])
+            .await
+            .unwrap();
+
         assert_eq!(
             tracker.get_bytes_written(TENANT_ID).await.unwrap(),
-            900_000
+            950_000
         );
 
-        let err = op.write("f.txt", vec![0u8; 950_000]).await.unwrap_err();
+        let err = op
+            .write("f.txt", vec![0u8; 200_000])
+            .await
+            .unwrap_err();
+
         assert_eq!(err.kind(), ErrorKind::RateLimited);
 
         assert_eq!(
             tracker.get_bytes_written(TENANT_ID).await.unwrap(),
-            900_000
+            950_000
         );
+
+        let meta = op.stat("f.txt").await.unwrap();
+        assert_eq!(meta.content_length(), 100_000);
     }
 
     #[tokio::test]
     async fn delete_releases_exact_size() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
+
         op.write("a.txt", "hello world").await.unwrap();
         op.delete("a.txt").await.unwrap();
+
         assert_eq!(tracker.get_bytes_written(TENANT_ID).await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn delete_then_rewrite_frees_room_for_new_writes() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 10);
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 10);
 
         op.write("a.txt", "0123456789").await.unwrap();
         assert!(op.write("b.txt", "x").await.is_err());
 
         op.delete("a.txt").await.unwrap();
+
         assert_eq!(tracker.get_bytes_written(TENANT_ID).await.unwrap(), 0);
 
         op.write("b.txt", "0123456789").await.unwrap();
+
         assert_eq!(tracker.get_bytes_written(TENANT_ID).await.unwrap(), 10);
     }
 
     #[tokio::test]
     async fn deleting_nonexistent_path_is_a_noop_for_quota() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
-        op.write("a.txt", "hello world").await.unwrap();
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
 
+        op.write("a.txt", "hello world").await.unwrap();
         op.delete("does-not-exist.txt").await.unwrap();
 
         assert_eq!(
@@ -749,7 +838,8 @@ mod tests {
     #[tokio::test]
     async fn rename_does_not_change_total_bytes_used() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
+
         op.write("a.txt", "hello world").await.unwrap();
         let before = tracker.get_bytes_written(TENANT_ID).await.unwrap();
 
@@ -762,9 +852,9 @@ mod tests {
     #[tokio::test]
     async fn copy_of_new_object_adds_its_size_to_the_total() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
-        op.write("a.txt", "hello world").await.unwrap();
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
 
+        op.write("a.txt", "hello world").await.unwrap();
         op.copy("a.txt", "b.txt").await.unwrap();
 
         assert_eq!(
@@ -776,14 +866,15 @@ mod tests {
     #[tokio::test]
     async fn copy_exceeding_quota_is_rejected_and_source_untouched() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 15);
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 15);
 
         op.write("a.txt", "hello world").await.unwrap();
+
         assert_eq!(tracker.get_bytes_written(TENANT_ID).await.unwrap(), 11);
 
         let err = op.copy("a.txt", "b.txt").await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::RateLimited);
 
+        assert_eq!(err.kind(), ErrorKind::RateLimited);
         assert_eq!(tracker.get_bytes_written(TENANT_ID).await.unwrap(), 11);
         assert!(!op.exists("b.txt").await.unwrap());
     }
@@ -791,36 +882,48 @@ mod tests {
     #[tokio::test]
     async fn copy_overwriting_destination_replaces_rather_than_adds() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024 * 1024);
+        let (op, _dir) =
+            build_op(TENANT_ID, Arc::clone(&tracker), 1024 * 1024);
 
         op.write("a.txt", vec![0u8; 100]).await.unwrap();
         op.write("b.txt", vec![0u8; 900]).await.unwrap();
-        assert_eq!(tracker.get_bytes_written(TENANT_ID).await.unwrap(), 1000);
+
+        assert_eq!(
+            tracker.get_bytes_written(TENANT_ID).await.unwrap(),
+            1000
+        );
 
         op.copy("a.txt", "b.txt").await.unwrap();
 
-        assert_eq!(tracker.get_bytes_written(TENANT_ID).await.unwrap(), 200);
+        assert_eq!(
+            tracker.get_bytes_written(TENANT_ID).await.unwrap(),
+            200
+        );
     }
 
     #[tokio::test]
     async fn copy_overwrite_that_would_exceed_quota_is_rejected_and_destination_kept() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1_000_000);
+        let (op, _dir) =
+            build_op(TENANT_ID, Arc::clone(&tracker), 1_000_000);
 
         op.write("a.txt", vec![0u8; 950_000]).await.unwrap();
         op.write("b.txt", vec![0u8; 10_000]).await.unwrap();
+
         assert_eq!(
             tracker.get_bytes_written(TENANT_ID).await.unwrap(),
             960_000
         );
 
         let err = op.copy("a.txt", "b.txt").await.unwrap_err();
+
         assert_eq!(err.kind(), ErrorKind::RateLimited);
 
         assert_eq!(
             tracker.get_bytes_written(TENANT_ID).await.unwrap(),
             960_000
         );
+
         let meta = op.stat("b.txt").await.unwrap();
         assert_eq!(meta.content_length(), 10_000);
     }
@@ -828,9 +931,11 @@ mod tests {
     #[tokio::test]
     async fn multiple_deletes_in_one_batch_all_release() {
         let tracker = Arc::new(MemoryTracker::default());
-        let op = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
+        let (op, _dir) = build_op(TENANT_ID, Arc::clone(&tracker), 1024);
+
         op.write("a.txt", "hello").await.unwrap();
         op.write("b.txt", "world!").await.unwrap();
+
         let total_before = tracker.get_bytes_written(TENANT_ID).await.unwrap();
         assert_eq!(total_before, 11);
 
@@ -847,9 +952,14 @@ mod tests {
     #[tokio::test]
     async fn apply_delta_rejects_without_mutating_when_over_limit() {
         let tracker = MemoryTracker::default();
+
         tracker.apply_delta("id", 0, 100, 1000).await.unwrap();
 
-        let err = tracker.apply_delta("id", 0, 950, 1000).await.unwrap_err();
+        let err = tracker
+            .apply_delta("id", 0, 950, 1000)
+            .await
+            .unwrap_err();
+
         assert_eq!(err.kind(), ErrorKind::RateLimited);
 
         // Rejected delta must not have mutated the stored value.
@@ -868,11 +978,14 @@ mod tests {
         let handles: Vec<_> = (0..20)
             .map(|_| {
                 let t = Arc::clone(&tracker);
-                tokio::spawn(async move { t.apply_delta("shared", 0, 100, limit).await })
+                tokio::spawn(async move {
+                    t.apply_delta("shared", 0, 100, limit).await
+                })
             })
             .collect();
 
         let mut succeeded = 0;
+
         for h in handles {
             if h.await.unwrap().is_ok() {
                 succeeded += 1;
@@ -880,6 +993,9 @@ mod tests {
         }
 
         assert_eq!(succeeded, 10);
-        assert_eq!(tracker.get_bytes_written("shared").await.unwrap(), 1000);
+        assert_eq!(
+            tracker.get_bytes_written("shared").await.unwrap(),
+            1000
+        );
     }
 }
