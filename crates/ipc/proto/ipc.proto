@@ -23,9 +23,28 @@ message VfsPoint {
   }
 }
 
+message VfsInfo {
+  string user = 1;
+  VfsPoint point = 2;
+  uint64 used_bytes = 3;
+}
+
 message VfsUser {
   string name = 1;
-  repeated VfsPoint points = 2;
+  string password = 2;
+  repeated VfsPoint points = 3;
+}
+
+message VfsPath {
+  oneof path {
+    string virtual = 1;
+    IndexedPath indexed = 2;
+  }
+}
+
+message IndexedPath {
+  string point_name = 1;
+  string point_path = 2;
 }
 
 enum Priority {
@@ -88,11 +107,12 @@ message Snapshot {
 // user's mounted data points) to the repo point named "repo_name".
 message BackupArgs {
   string user = 1;
-  string source_path = 2;
-  string repo_name = 3;
-  optional DataFilter filter = 4;
-  repeated string tags = 5;
-  bool dry_run = 6;
+  string data_name = 2;
+  string source_path = 3;
+  string repo_name = 4;
+  optional DataFilter filter = 5;
+  repeated string tags = 6;
+  bool dry_run = 7;
 }
 
 // Example: restore "/" from repo point "repo_name", snapshot "xyz", to VFS
@@ -102,9 +122,10 @@ message RestoreArgs {
   string repo_name = 2;
   string snapshot_id = 3;
   string snapshot_path = 4;
-  string output_path = 5; // the destination VFS data path
-  bool delete = 6;
-  bool dry_run = 7;
+  string data_name = 5;
+  string output_path = 6; // the destination VFS data path
+  bool delete = 7;
+  bool dry_run = 8;
 }
 
 message CheckArgs {
@@ -212,7 +233,7 @@ message ListVfsResponse {
 
 message ReadVfsArgs {
   string user = 1;
-  string path = 2;
+  VfsPath path = 2;
   uint64 offset = 3;
   uint64 length = 4;
 }
@@ -223,21 +244,21 @@ message ReadVfsResponse {
 
 message WriteVfsArgs {
   string user = 1;
-  string path = 2;
+  VfsPath path = 2;
   bytes data = 3;
   bool append = 4;
 }
 
 message FilePath {
   string user = 1;
-  string path = 2;
+  VfsPath path = 2;
 }
 
 message TransferArgs {
   string old_user = 1;
-  string old_path = 2;
+  VfsPath old_path = 2;
   string new_user = 3;
-  string new_path = 4;
+  VfsPath new_path = 4;
   bool copy = 5;
 }
 
@@ -248,6 +269,11 @@ message StatResponse {
 message ExistsResponse {
   bool exists = 1;
 }
+
+message InfoResponse {
+  repeated VfsInfo info = 1;
+}
+
 
 message Empty {}
 
@@ -260,6 +286,7 @@ service IpcService {
   rpc CancelJob(CancelArgs) returns (JobCancelResponse);
   rpc Poll(Empty) returns (PollResponse);
   rpc SetVfs(SetVfsArgs) returns (Empty);
+  rpc GetVfs(Empty) returns (InfoResponse);
 
   rpc Vfs_ReadFile(ReadVfsArgs) returns (ReadVfsResponse);
   rpc Vfs_WriteFile(WriteVfsArgs) returns (Empty);
@@ -274,4 +301,5 @@ service IpcService {
   rpc Vfs_Exists(FilePath) returns (ExistsResponse);
 
   rpc Vfs_Transfer(TransferArgs) returns (Empty);
+
 }

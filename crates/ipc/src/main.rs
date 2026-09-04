@@ -21,11 +21,12 @@ pub mod ipc {
     tonic::include_proto!("ipc");
 }
 
+mod core;
 mod db;
+mod ftp;
 mod progress;
 mod server;
 mod store;
-mod core;
 mod utils;
 
 pub(crate) fn proto_stamp(ts: rustic_core::jiff::Timestamp) -> Option<Timestamp> {
@@ -40,15 +41,39 @@ const TTL: Duration = Duration::from_mins(3);
 #[tokio::main]
 async fn main() {
     use rustic_core::*;
+
     let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
-    let ip = "127.0.0.1:8080".parse().expect("Failed to parse IP!");
+
     let db = Arc::new(DbManager::open("poop.sqlite").await.unwrap());
     let store = Arc::new(StorageManager::new(db.clone(), TTL));
     let serv = GrpcServer::new(store.clone(), db.clone());
+    let ftp = Arc::new(ftp::FtpServer::new(store.clone(), db.clone()));
 
-    Server::builder()
-        .add_service(IpcServiceServer::new(serv))
-        .serve(ip)
-        .await
-        .unwrap()
+    let ftp_server = libunftp::ServerBuilder::with_user_detail_provider(
+        Box::new({
+            let ftp = ftp.clone();
+            move || (*ftp).clone()
+        }),
+        ftp.clone(),
+    )
+    .authenticator(ftp)
+    .build()
+    .unwrap();
+
+    tokio::try_join!(
+        async {
+            Server::builder()
+                .add_service(IpcServiceServer::new(serv))
+                .serve("127.0.0.1:8080".parse().unwrap())
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        },
+        async {
+            ftp_server
+                .listen("127.0.0.1:2121")
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        },
+    )
+    .unwrap();
 }

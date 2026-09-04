@@ -5,32 +5,28 @@ use dashmap::DashMap;
 use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
 use rustic_backend::opendal::OpenDALSource;
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+use crate::core::{UserSystem, VfsPoint, VfsUser};
 use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
 use crate::ipc::job_event::Data;
+use crate::ipc::vfs_path::Path;
 use crate::ipc::vfs_point::Src as ProtoSrc;
-use crate::ipc::{
-    BackupArgs, CancelArgs, CheckArgs, Empty, ExistsResponse, FilePath, ForgetArgs,
-    GetSnapshotArgs, JobCancelResponse, JobEvent, JobFinishedEvent, JobNewMessageEvent,
-    JobStartResponse, ListVfsResponse, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse,
-    RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs,
-    VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteVfsArgs,
-};
+use crate::ipc::{BackupArgs, CancelArgs, CheckArgs, Empty, ExistsResponse, FilePath, ForgetArgs, GetSnapshotArgs, InfoResponse, JobCancelResponse, JobEvent, JobFinishedEvent, JobNewMessageEvent, JobStartResponse, ListVfsResponse, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs, VfsNode, VfsPath, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteVfsArgs};
+use crate::store::StorageSystem;
+use crate::utils;
+use crate::utils::{fix_path, map_dal, map_vfs};
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
 use rustic_core::{
     BackupOptions, CancelToken, CheckOptions, LsOptions, PathList, RestoreOptions, SnapshotOptions,
     StringList,
 };
-
-use crate::core::{UserSystem, VfsPoint, VfsUser};
-use crate::store::StorageSystem;
-use crate::utils;
-use crate::utils::{fix_path, map_dal, map_vfs};
+use unftp_core::storage::{Metadata, StorageBackend};
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 impl TryFrom<ProtoVfsPoint> for VfsPoint {
@@ -64,6 +60,7 @@ impl TryFrom<ProtoVfsUser> for VfsUser {
     fn try_from(p: ProtoVfsUser) -> Result<Self, Status> {
         Ok(VfsUser {
             username: p.name,
+            password: p.password,
             points: p
                 .points
                 .into_iter()
@@ -109,6 +106,18 @@ impl From<SnapshotFile> for Snapshot {
             tags: s.tags.iter().map(|t| t.to_string()).collect(),
             paths: s.paths.iter().map(|p| p.to_string()).collect(),
             app_version: s.program_version,
+        }
+    }
+}
+
+impl std::fmt::Display for VfsPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.path {
+            None => Ok(()),
+            Some(Path::Virtual(path)) => f.write_str(path),
+            Some(Path::Indexed(path)) => {
+                write!(f, "/points/{}/{}", path.point_name, path.point_path)
+            }
         }
     }
 }
@@ -187,16 +196,19 @@ where
     async fn get_operator(
         &self,
         user: &str,
-        path: &str,
+        path: &Option<VfsPath>,
         is_dir: bool,
     ) -> Result<(Operator, String), Status> {
         let user = self.get_user(user).await?;
         let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
-        Ok((op, fix_path(path, is_dir)))
+        let path = path
+            .as_ref()
+            .ok_or(Status::invalid_argument("path is blank"))?;
+        Ok((op, fix_path(path.to_string(), is_dir)))
     }
 
     async fn get_user(&self, user: &str) -> Result<VfsUser, Status> {
-        self.inner.users.load_user(&user).await.map_err(map_vfs)
+        self.inner.users.get_user(&user).await.map_err(map_vfs)
     }
 
     /// Spawn a background job and return its ID immediately.
@@ -208,12 +220,12 @@ where
     fn spawn_job<F>(&self, f: F) -> String
     where
         F: FnOnce(
-            Uuid,
-            chan::Sender<Data>,
-            CancelToken,
-        ) -> rustic_core::RusticResult<Option<String>>
-        + Send
-        + 'static,
+                Uuid,
+                chan::Sender<Data>,
+                CancelToken,
+            ) -> rustic_core::RusticResult<Option<String>>
+            + Send
+            + 'static,
     {
         let job_id = Uuid::new_v4();
         let token = CancelToken::new();
@@ -273,7 +285,7 @@ where
         let user = self.get_user(&args.user).await?;
 
         let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
-        let (data_config, backup_path) = utils::resolve_data_path(&user, &args.source_path)?;
+        let data_config = utils::resolve_data_point(&user, &args.data_name, &args.source_path)?;
         let tags = args.tags;
         let storage = Arc::clone(&self.inner.storage);
 
@@ -287,7 +299,7 @@ where
                 &BackupOptions::default(),
                 &source,
                 snap,
-                PathList::from(backup_path),
+                PathList::from(args.source_path),
                 token,
             )?;
             Ok(Some(saved.id.to_string()))
@@ -304,7 +316,7 @@ where
         let user = self.get_user(&args.user).await?;
 
         let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
-        let (dest_config, restore_path) = utils::resolve_data_path(&user, &args.output_path)?;
+        let dest_config = utils::resolve_data_point(&user, &args.data_name, &args.output_path)?;
         let snapshot_id = args.snapshot_id;
         let snapshot_path = args.snapshot_path;
         let delete = args.delete;
@@ -324,7 +336,7 @@ where
                 &opts,
                 ls.clone(),
                 &dest,
-                &restore_path,
+                &args.output_path,
                 dry_run,
                 token.clone(),
             )?;
@@ -532,7 +544,10 @@ where
     async fn vfs_remove_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
         let (op, path) = self.get_operator(&args.user, &args.path, true).await?;
-        op.delete_with(&path).recursive(true).await.map_err(map_dal)?;
+        op.delete_with(&path)
+            .recursive(true)
+            .await
+            .map_err(map_dal)?;
         Ok(Response::new(Empty {}))
     }
 
@@ -548,18 +563,17 @@ where
         let meta = match op.stat(&file_path).await {
             Ok(meta) => meta,
             Err(e) if e.kind() == DalErrorKind::NotFound => {
-                let dir_path = fix_path(&args.path, true);
+                let dir_path = fix_path(&file_path, true);
                 op.stat(&dir_path).await.map_err(map_dal)?
             }
             Err(e) => return Err(map_dal(e)),
         };
 
-        let name = args
-            .path
+        let name = file_path
             .trim_end_matches('/')
             .rsplit('/')
             .next()
-            .unwrap_or(&args.path)
+            .unwrap_or(&file_path)
             .to_string();
 
         let mtime = meta.last_modified().map(chrono_to_ts);
@@ -589,7 +603,7 @@ where
         let exists = match op.stat(&file_path).await {
             Ok(_) => true,
             Err(e) if e.kind() == DalErrorKind::NotFound => {
-                let dir_path = fix_path(&args.path, true);
+                let dir_path = fix_path(&file_path, true);
                 match op.stat(&dir_path).await {
                     Ok(_) => true,
                     Err(e2) if e2.kind() == DalErrorKind::NotFound => false,
@@ -646,5 +660,9 @@ where
         }
 
         Ok(Response::new(Empty {}))
+    }
+
+    async fn get_vfs(&self, request: Request<Empty>) -> Result<Response<InfoResponse>, Status> {
+        todo!()
     }
 }

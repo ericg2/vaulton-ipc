@@ -105,6 +105,39 @@ pub fn resolve_repo_point(user: &VfsUser, repo_name: &str) -> Result<RepoSource,
     })
 }
 
+/// Resolves a data point and path within that point against a loaded
+/// [`VfsUser`]'s mounted points.
+///
+/// Returns the [`OpenDALConfig`] for the underlying data point plus the
+/// remaining path within that point. Only data points (`is_repo = false`)
+/// are supported for backup/restore — repo-mounted paths are intentionally
+/// rejected.
+pub fn resolve_data_point(
+    user: &VfsUser,
+    point_name: &str,
+    point_path: &str,
+) -> Result<OpenDALConfig, Status> {
+    let point = user
+        .points
+        .iter()
+        .find(|p| p.name == point_name)
+        .ok_or_else(|| {
+            Status::invalid_argument(format!("data point '{point_name}' not found"))
+        })?;
+
+    if point.is_repo {
+        return Err(Status::invalid_argument(format!(
+            "point '{point_name}' is a repo, not a data point"
+        )));
+    }
+
+    let config = OpenDALConfig::default()
+        .scheme(point.scheme.clone())
+        .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
+
+    Ok(config)
+}
+
 /// Resolves a VFS-relative path (as exposed to VFS clients, e.g.
 /// `/points/<name>/sub/dir`) against a loaded [`VfsUser`]'s mounted points.
 ///
@@ -130,26 +163,15 @@ pub fn resolve_data_path(
     let point_name = parts
         .next()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| Status::invalid_argument(format!("path '{vfs_path}' is missing a point name")))?;
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "path '{vfs_path}' is missing a point name"
+            ))
+        })?;
+
     let rest = parts.next().unwrap_or("");
-
-    let point = user
-        .points
-        .iter()
-        .find(|p| p.name == point_name)
-        .ok_or_else(|| Status::invalid_argument(format!("data point '{point_name}' not found")))?;
-
-    if point.is_repo {
-        return Err(Status::invalid_argument(format!(
-            "point '{point_name}' is a repo, not a data point"
-        )));
-    }
-
-    let config = OpenDALConfig::default()
-        .scheme(point.scheme.clone())
-        .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
-
-    Ok((config, PathBuf::from(rest)))
+    let cfg = resolve_data_point(user, point_name, rest)?;
+    Ok((cfg, PathBuf::from(rest)))
 }
 
 pub fn vfs_permission_denied(path: &str) -> Error {

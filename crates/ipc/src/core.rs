@@ -20,12 +20,13 @@
 //! user record in the store, call [`VfsManager::invalidate`] to drop the
 //! stale entry so the next call rebuilds from fresh data.
 
+use crate::store::StorageSystem;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Formatter;
 use thiserror::Error;
-
-use crate::store::StorageSystem;
+use unftp_core::auth::UserDetail;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -96,16 +97,31 @@ pub struct VfsUser {
     /// one shared [`QuotaTracker`] correctly isolates every user.
     pub username: String,
 
+    /// The password to use.
+    pub password: String,
+
     /// Ordered mount points owned by this user.
     pub points: Vec<VfsPoint>,
 }
+
+impl std::fmt::Display for VfsUser {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &self.username)
+    }
+}
+
+impl UserDetail for VfsUser {}
 
 // ── VfsStore ──────────────────────────────────────────────────────────────────
 /// Database persistence for [`VfsUser`] records.
 #[async_trait]
 pub trait UserSystem: Send + Sync + 'static {
-    async fn load_user(&self, username: &str) -> VfsResult<VfsUser>;
+    /// Returns a single user.
+    async fn get_user(&self, username: &str) -> VfsResult<VfsUser>;
 
     /// Sets the list of users.
     async fn set_users(&self, users: Vec<VfsUser>) -> VfsResult<()>;
+    
+    /// Returns a list of all users.
+    async fn get_users(&self) -> VfsResult<Vec<VfsUser>>;
 }

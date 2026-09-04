@@ -362,7 +362,11 @@ impl Service for MountAccess {
                             format!("{}/{name}/", base.trim_start_matches('/'))
                         };
 
-                        oio::Entry::new(&full, Metadata::new(EntryMode::DIR))
+                        oio::Entry::new(
+                            &full,
+                            Metadata::new(EntryMode::DIR)
+                                .with_last_modified(Timestamp::from_second(0).unwrap()),
+                        )
                     })
                     .collect();
 
