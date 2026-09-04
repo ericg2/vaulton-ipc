@@ -206,7 +206,7 @@ impl StorageManager {
                 // If the point is a data point - it becomes better!
                 let op = Operator::via_iter(&point.scheme, point.config.clone())?;
                 vfs = vfs.mount(format!("/points/{}", &point.name), op);
-                if point.read_only {
+                if point.read_only || point.is_repo {
                     vfs = vfs.read_only();
                 } else if let Some(max) = point.max_bytes {
                     vfs = vfs.quota(format!("{}-{}", &user.username, &point.name), max);
