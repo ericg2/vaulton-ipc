@@ -148,7 +148,12 @@ impl std::fmt::Display for VfsPath {
             None => Ok(()),
             Some(Path::Virtual(path)) => f.write_str(path),
             Some(Path::Indexed(path)) => {
-                write!(f, "/points/{}/{}", path.point_name, path.point_path)
+                write!(
+                    f,
+                    "{}/{}",
+                    utils::data_mount_path(&path.point_name),
+                    path.point_path
+                )
             }
         }
     }
@@ -257,12 +262,12 @@ where
     fn spawn_job<F>(&self, f: F) -> String
     where
         F: FnOnce(
-                Uuid,
-                chan::Sender<Data>,
-                CancelToken,
-            ) -> rustic_core::RusticResult<Option<String>>
-            + Send
-            + 'static,
+            Uuid,
+            chan::Sender<Data>,
+            CancelToken,
+        ) -> rustic_core::RusticResult<Option<String>>
+        + Send
+        + 'static,
     {
         let job_id = Uuid::new_v4();
         let token = CancelToken::new();
@@ -322,14 +327,26 @@ where
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
 
-        let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
-        let data_config = utils::resolve_data_point(&user, &args.data_name, &args.source_path)?;
+        // Backups write new snapshots into the repo, so reject up front if
+        // the repo point was marked read-only instead of letting the job
+        // fail once it's already running.
+        let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
+        utils::require_writable(repo_point)?;
+        let repo_src = utils::repo_source(repo_point)?;
+
+        let data_point = utils::require_data_point(&user, &args.data_name)?;
+        let source_op = self
+            .inner
+            .storage
+            .get_data_operator(&user, data_point)
+            .map_err(map_vfs)?;
+
         let tags = args.tags;
         let storage = Arc::clone(&self.inner.storage);
 
         let job_id = self.spawn_job(move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
-            let source = OpenDALSource::from_config(&data_config)?;
+            let source = OpenDALSource::new(source_op);
             let tags = StringList::from_str(&tags.join(",")).unwrap();
             let snap = SnapshotOptions::default().tags(vec![tags]).to_snapshot()?;
             let repo = handle.block_on(storage.get_repo_job(&repo_src, job_id, tx))?;
@@ -353,8 +370,19 @@ where
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
 
-        let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
-        let dest_config = utils::resolve_data_point(&user, &args.data_name, &args.output_path)?;
+        let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
+        let repo_src = utils::repo_source(repo_point)?;
+
+        // Restores write into the destination data point, so it must be
+        // writable — checked up front for the same reason as backup above.
+        let dest_point = utils::require_data_point(&user, &args.data_name)?;
+        utils::require_writable(dest_point)?;
+        let dest_op = self
+            .inner
+            .storage
+            .get_data_operator(&user, dest_point)
+            .map_err(map_vfs)?;
+
         let snapshot_id = args.snapshot_id;
         let snapshot_path = args.snapshot_path;
         let delete = args.delete;
@@ -364,7 +392,7 @@ where
         let job_id = self.spawn_job(move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
             let repo = Arc::new(handle.block_on(storage.get_repo_job(&repo_src, job_id, tx))?);
-            let dest = OpenDALSource::from_config(&dest_config)?;
+            let dest = OpenDALSource::new(dest_op);
             let opts = RestoreOptions::default().delete(delete);
             let snap_path = format!("{}:{}", &snapshot_id, &snapshot_path);
             let node = repo.node_from_snapshot_path(&snap_path, |_| true)?;
@@ -391,7 +419,7 @@ where
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
 
-        let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
+        let repo_src = utils::repo_source(utils::require_repo_point(&user, &args.repo_name)?)?;
         let storage = Arc::clone(&self.inner.storage);
 
         let job_id = self.spawn_job(move |job_id, tx, _token| {
@@ -408,7 +436,11 @@ where
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
 
-        let repo_src = utils::resolve_repo_point(&user, &args.repo_name)?;
+        // Forget deletes snapshots from the repo, so it's write-bound like
+        // backup — reject up front if the repo point is read-only.
+        let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
+        utils::require_writable(repo_point)?;
+        let repo_src = utils::repo_source(repo_point)?;
 
         let snap_ids: Vec<SnapshotId> = args
             .snapshots
@@ -439,7 +471,7 @@ where
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
 
-        let repo_src = utils::resolve_repo_point(&user, &args.repo_src)?;
+        let repo_src = utils::repo_source(utils::require_repo_point(&user, &args.repo_src)?)?;
 
         // get_repo is async (spawn_blocking inside), so .await here is correct.
         // get_all_snapshots is blocking, so it gets its own spawn_blocking.
@@ -524,7 +556,7 @@ where
 
                             if !still_exists && !old_point.is_repo {
                                 removed_quotas
-                                    .push(format!("{}-{}", old_user.username, old_point.name));
+                                    .push(utils::quota_id(&old_user.username, &old_point.name));
                             }
                         }
                     }
@@ -537,7 +569,7 @@ where
                     // Remove all quota state belonging to this user.
                     for point in &old_user.points {
                         if !point.is_repo {
-                            removed_quotas.push(format!("{}-{}", old_user.username, point.name));
+                            removed_quotas.push(utils::quota_id(&old_user.username, &point.name));
                         }
                     }
                 }
@@ -768,7 +800,7 @@ where
                 } else {
                     self.inner
                         .quota
-                        .get_bytes_written(&format!("{}-{}", &user.username, &point.name))
+                        .get_bytes_written(&utils::quota_id(&user.username, &point.name))
                         .await
                         .map_err(|err| Status::internal(err.to_string()))?
                 };

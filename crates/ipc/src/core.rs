@@ -71,7 +71,11 @@ pub struct VfsPoint {
     pub max_bytes: Option<u64>,
 
     /// When `true`, writes and deletes are rejected at the mount level.
-    /// Repo mounts are always read-only regardless of this flag.
+    ///
+    /// For data points this gates the VFS mount directly. For repo points
+    /// the VFS mount is always read-only regardless of this flag — instead,
+    /// here it gates whether backup/forget jobs may write to the repo at
+    /// all (see `utils::require_writable` in the server layer).
     pub read_only: bool,
 
     /// The storage scheme to use. Example: `s3`.
@@ -120,7 +124,7 @@ pub trait UserSystem: Send + Sync + 'static {
 
     /// Sets the list of users.
     async fn set_users(&self, users: Vec<VfsUser>) -> VfsResult<()>;
-    
+
     /// Returns a list of all users.
     async fn get_users(&self) -> VfsResult<Vec<VfsUser>>;
 }
