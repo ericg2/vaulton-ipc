@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use crossbeam_channel::Sender;
 use moka::sync::Cache;
 use opendal_core::Operator;
-use opendal_vfs::layers::quota::{QuotaLayer, QuotaTracker};
+use opendal_core::options::WriteOptions;
+use opendal_vfs::layers::quota::{QuotaLayer, QuotaState, QuotaTracker};
 use opendal_vfs::layers::read_only::ReadOnlyLayer;
 use opendal_vfs::layers::vfs::VfsBuilder;
 use rustic_backend::opendal::*;
@@ -24,7 +25,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
-use opendal_core::options::WriteOptions;
 use unftp_core::storage::StorageBackend;
 use uuid::Uuid;
 
@@ -54,6 +54,7 @@ pub trait StorageSystem: Send + Sync + 'static {
     async fn get_repo_job(
         &self,
         src: &RepoSource,
+        op: opendal_core::blocking::Operator,
         job_id: Uuid,
         tx: Sender<Data>,
     ) -> RusticResult<RepoIndexed>;
@@ -72,7 +73,11 @@ pub trait StorageSystem: Send + Sync + 'static {
     /// backend directly (via `OpenDALSource::new`) rather than through the
     /// user's mounted VFS tree — without this, those jobs would bypass quota
     /// enforcement and the point's read-only flag entirely.
-    fn get_data_operator(&self, user: &VfsUser, point: &VfsPoint) -> VfsResult<opendal_core::blocking::Operator>;
+    fn get_data_operator(
+        &self,
+        user: &VfsUser,
+        point: &VfsPoint,
+    ) -> VfsResult<opendal_core::blocking::Operator>;
 }
 
 /// Identifies a rustic repository by its storage scheme and decryption
@@ -100,7 +105,7 @@ pub struct RepoSource {
 pub struct StorageManager {
     repos: Cache<RepoSource, Arc<RepoIndexed>>,
     vfs_ops: Cache<VfsUser, Operator>,
-    db: Arc<DbManager>,
+    pub(crate) state: QuotaState,
 }
 
 impl StorageManager {
@@ -118,7 +123,7 @@ impl StorageManager {
                 .max_capacity(1000)
                 .build(),
 
-            db,
+            state: QuotaState::new(db.clone()),
         }
     }
 
@@ -147,15 +152,14 @@ impl StorageManager {
     fn create_for_job(
         &self,
         src: &RepoSource,
+        op: opendal_core::blocking::Operator,
         job_id: Uuid,
         tx: Sender<Data>,
         init: bool,
     ) -> RusticResult<RepoIndexed> {
         let creds = Credentials::password(&src.password);
-        let config = OpenDALConfig::default()
-            .scheme(src.scheme.clone())
-            .options(src.config.clone().into_iter().collect::<HashMap<_, _>>());
-        let backend = BackendOptions::default().with_repo(&config).to_backends()?;
+        let config = OpenDALSource::new(op);
+        let backend = config.to_backends()?;
         let pb = RusticProgressBars::new(job_id, tx);
         let repo = Repository::new_with_progress(&RepositoryOptions::default(), &backend, pb)?;
         if init {
@@ -209,10 +213,9 @@ impl StorageManager {
         if point.read_only {
             op = op.layer(ReadOnlyLayer);
         } else if let Some(max) = point.max_bytes {
-            let tracker: Arc<dyn QuotaTracker> = self.db.clone();
             op = op.layer(QuotaLayer::new(
+                self.state.clone(),
                 utils::quota_id(&user.username, &point.name),
-                tracker,
                 max,
             ));
         }
@@ -221,7 +224,7 @@ impl StorageManager {
     }
 
     fn create_for_vfs(&self, user: &VfsUser) -> VfsResult<Operator> {
-        let mut vfs = VfsBuilder::new(self.db.clone());
+        let mut vfs = VfsBuilder::new(self.state.clone());
         for point in user.points.iter() {
             if point.is_repo {
                 let pass = point
@@ -286,14 +289,15 @@ impl StorageSystem for StorageManager {
     async fn get_repo_job(
         &self,
         src: &RepoSource,
+        operator: opendal_core::blocking::Operator,
         job_id: Uuid,
         tx: Sender<Data>,
     ) -> RusticResult<RepoIndexed> {
         let this = self.clone();
         let src = src.clone();
         tokio::task::spawn_blocking(move || {
-            this.create_for_job(&src, job_id, tx.clone(), false)
-                .or_else(|_| this.create_for_job(&src, job_id, tx, true))
+            this.create_for_job(&src, operator.clone(), job_id, tx.clone(), false)
+                .or_else(|_| this.create_for_job(&src, operator, job_id, tx, true))
         })
         .await
         .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
@@ -319,11 +323,16 @@ impl StorageSystem for StorageManager {
         self.vfs_ops.invalidate(user);
     }
 
-    fn get_data_operator(&self, user: &VfsUser, point: &VfsPoint) -> VfsResult<opendal_core::blocking::Operator> {
+    fn get_data_operator(
+        &self,
+        user: &VfsUser,
+        point: &VfsPoint,
+    ) -> VfsResult<opendal_core::blocking::Operator> {
         let op = self.point_operator(user, point)?;
         let x = opendal_core::blocking::Operator::new(op)?;
         Ok(x)
     }
+
 }
 
 // ---------------------------------------------------------------------------

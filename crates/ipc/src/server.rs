@@ -2,12 +2,12 @@
 
 use crossbeam_channel as chan;
 use dashmap::DashMap;
+use log::warn;
 use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
 use rustic_backend::opendal::OpenDALSource;
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
-use log::warn;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -27,7 +27,7 @@ use crate::ipc::{
 use crate::store::StorageSystem;
 use crate::utils;
 use crate::utils::{fix_path, map_dal, map_vfs};
-use opendal_vfs::layers::quota::QuotaTracker;
+use opendal_vfs::layers::quota::{QuotaState, QuotaTracker};
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
 use rustic_core::{
@@ -192,37 +192,34 @@ fn chrono_to_ts(ts: opendal_core::raw::Timestamp) -> prost_types::Timestamp {
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
-struct Inner<S, U, Q>
+struct Inner<S, U>
 where
     S: StorageSystem,
     U: UserSystem,
-    Q: QuotaTracker,
 {
     storage: Arc<S>,
     users: Arc<U>,
-    quota: Arc<Q>,
+    quota: QuotaState,
     jobs: DashMap<Uuid, CancelToken>,
     events: StdMutex<VecDeque<JobEvent>>,
 }
 
 /// tonic service handle. Cheap to clone — all state lives behind `Arc`.
 #[derive(Clone)]
-pub struct GrpcServer<S, U, Q>
+pub struct GrpcServer<S, U>
 where
     S: StorageSystem,
     U: UserSystem,
-    Q: QuotaTracker,
 {
-    inner: Arc<Inner<S, U, Q>>,
+    inner: Arc<Inner<S, U>>,
 }
 
-impl<S, U, Q> GrpcServer<S, U, Q>
+impl<S, U> GrpcServer<S, U>
 where
     S: StorageSystem,
     U: UserSystem,
-    Q: QuotaTracker,
 {
-    pub fn new(storage: Arc<S>, users: Arc<U>, quota: Arc<Q>) -> Self {
+    pub fn new(storage: Arc<S>, users: Arc<U>, quota: QuotaState) -> Self {
         Self {
             inner: Arc::new(Inner {
                 storage,
@@ -262,12 +259,12 @@ where
     fn spawn_job<F>(&self, f: F) -> String
     where
         F: FnOnce(
-            Uuid,
-            chan::Sender<Data>,
-            CancelToken,
-        ) -> rustic_core::RusticResult<Option<String>>
-        + Send
-        + 'static,
+                Uuid,
+                chan::Sender<Data>,
+                CancelToken,
+            ) -> rustic_core::RusticResult<Option<String>>
+            + Send
+            + 'static,
     {
         let job_id = Uuid::new_v4();
         let token = CancelToken::new();
@@ -317,11 +314,10 @@ where
 // ── IpcService ────────────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
-impl<S, U, Q> IpcServiceTrait for GrpcServer<S, U, Q>
+impl<S, U> IpcServiceTrait for GrpcServer<S, U>
 where
     S: StorageSystem,
     U: UserSystem,
-    Q: QuotaTracker,
 {
     async fn backup(&self, req: Request<BackupArgs>) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
@@ -341,6 +337,12 @@ where
             .get_data_operator(&user, data_point)
             .map_err(map_vfs)?;
 
+        let repo_op = self
+            .inner
+            .storage
+            .get_data_operator(&user, repo_point)
+            .map_err(map_vfs)?;
+
         let tags = args.tags;
         let storage = Arc::clone(&self.inner.storage);
 
@@ -349,7 +351,7 @@ where
             let source = OpenDALSource::new(source_op);
             let tags = StringList::from_str(&tags.join(",")).unwrap();
             let snap = SnapshotOptions::default().tags(vec![tags]).to_snapshot()?;
-            let repo = handle.block_on(storage.get_repo_job(&repo_src, job_id, tx))?;
+            let repo = handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?;
             let saved = repo.backup_with(
                 &BackupOptions::default(),
                 &source,
@@ -383,6 +385,12 @@ where
             .get_data_operator(&user, dest_point)
             .map_err(map_vfs)?;
 
+        let repo_op = self
+            .inner
+            .storage
+            .get_data_operator(&user, repo_point)
+            .map_err(map_vfs)?;
+
         let snapshot_id = args.snapshot_id;
         let snapshot_path = args.snapshot_path;
         let delete = args.delete;
@@ -391,7 +399,7 @@ where
 
         let job_id = self.spawn_job(move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
-            let repo = Arc::new(handle.block_on(storage.get_repo_job(&repo_src, job_id, tx))?);
+            let repo = Arc::new(handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?);
             let dest = OpenDALSource::new(dest_op);
             let opts = RestoreOptions::default().delete(delete);
             let snap_path = format!("{}:{}", &snapshot_id, &snapshot_path);
@@ -419,12 +427,19 @@ where
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
 
-        let repo_src = utils::repo_source(utils::require_repo_point(&user, &args.repo_name)?)?;
+        let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
+        let repo_src = utils::repo_source(repo_point)?;
+        let repo_op = self
+            .inner
+            .storage
+            .get_data_operator(&user, repo_point)
+            .map_err(map_vfs)?;
+
         let storage = Arc::clone(&self.inner.storage);
 
         let job_id = self.spawn_job(move |job_id, tx, _token| {
             let handle = tokio::runtime::Handle::current();
-            let repo = handle.block_on(storage.get_repo_job(&repo_src, job_id, tx))?;
+            let repo = handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?;
             repo.check(CheckOptions::default())?;
             Ok(None)
         });
@@ -441,6 +456,11 @@ where
         let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
         utils::require_writable(repo_point)?;
         let repo_src = utils::repo_source(repo_point)?;
+        let repo_op = self
+            .inner
+            .storage
+            .get_data_operator(&user, repo_point)
+            .map_err(map_vfs)?;
 
         let snap_ids: Vec<SnapshotId> = args
             .snapshots
@@ -456,7 +476,7 @@ where
 
         let job_id = self.spawn_job(move |job_id, tx, _token| {
             let handle = tokio::runtime::Handle::current();
-            let repo = handle.block_on(storage.get_repo_job(&repo_src, job_id, tx))?;
+            let repo = handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?;
             repo.delete_snapshots(&snap_ids)?;
             Ok(None)
         });
@@ -582,13 +602,19 @@ where
 
         // Invalidate only users whose VFS configuration changed.
         for user in changed_users {
-            warn!("Detected change on user: {}. Invalidating...", &user.username);
+            warn!(
+                "Detected change on user: {}. Invalidating...",
+                &user.username
+            );
             self.inner.storage.invalidate_vfs(&user);
         }
 
         // Remove quota state for points that were removed.
         for id in removed_quotas {
-            self.inner.quota.clear(&id).await.map_err(|_|Status::internal("Failed to clear quota."))?;
+            self.inner
+                .quota
+                .clear(&id)
+                .map_err(|_| Status::internal("Failed to clear quota."))?;
         }
 
         Ok(Response::new(Empty {}))
@@ -794,16 +820,12 @@ where
 
         for user in users {
             for point in &user.points {
-                let used_bytes = if point.is_repo {
-                    // Repository VFS points are read-only and don't have a quota.
-                    0
-                } else {
+                let used_bytes =
                     self.inner
                         .quota
-                        .get_bytes_written(&utils::quota_id(&user.username, &point.name))
+                        .current_bytes(&utils::quota_id(&user.username, &point.name))
                         .await
-                        .map_err(|err| Status::internal(err.to_string()))?
-                };
+                        .map_err(|err| Status::internal(err.to_string()))?;
 
                 info.push(crate::ipc::VfsInfo {
                     user: user.username.clone(),

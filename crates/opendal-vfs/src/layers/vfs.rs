@@ -50,14 +50,14 @@ pub enum VfsQuota {
 
 /// Builder for the `MountFs` backend.
 pub struct VfsBuilder {
-    tracker: Arc<dyn QuotaTracker>,
+    state: QuotaState,
     pending: Vec<PendingMount>,
 }
 
 impl Default for VfsBuilder {
     fn default() -> Self {
         Self {
-            tracker: Arc::new(MemoryTracker::default()),
+            state: QuotaState::new_owned(MemoryTracker::default()),
             pending: Vec::new(),
         }
     }
@@ -88,7 +88,7 @@ impl Builder for VfsBuilder {
             let mut op = pending.operator;
 
             if let VfsQuota::Enabled { id, bytes } = &pending.quota {
-                op = op.layer(QuotaLayer::new(id.clone(), self.tracker.clone(), *bytes));
+                op = op.layer(QuotaLayer::new(self.state.clone(), id.clone(), *bytes));
             }
 
             if pending.read_only {
@@ -118,16 +118,16 @@ impl Builder for VfsBuilder {
 
 impl VfsBuilder {
     /// Start an empty builder.
-    pub fn new(tracker: Arc<impl QuotaTracker>) -> Self {
+    pub fn new(state: QuotaState) -> Self {
         Self {
-            tracker,
+            state,
             pending: Vec::new(),
         }
     }
 
     /// Override the [`QuotaTracker`].
-    pub fn with_tracker(mut self, tracker: Arc<impl QuotaTracker>) -> Self {
-        self.tracker = tracker;
+    pub fn with_state(mut self, state: QuotaState) -> Self {
+        self.state = state;
         self
     }
 
@@ -509,7 +509,7 @@ mod tests {
     use std::sync::Arc;
 
     fn builder() -> VfsBuilder {
-        VfsBuilder::new(Arc::new(MemoryTracker::default()))
+        VfsBuilder::new(QuotaState::new_owned(MemoryTracker::default()))
     }
 
     fn memory() -> Operator {
