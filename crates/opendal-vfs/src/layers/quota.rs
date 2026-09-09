@@ -675,6 +675,7 @@ impl Service for QuotaAccessor {
     type Lister = oio::Lister;
     type Deleter = QuotaDeleter;
     type Copier = QuotaCopier<oio::Copier>;
+    type Composer = ();
 
     fn info(&self) -> ServiceInfo {
         self.inner.info()
@@ -741,13 +742,12 @@ impl Service for QuotaAccessor {
         from: &str,
         to: &str,
         args: OpCopy,
-        opts: OpCopier,
     ) -> Result<Self::Copier> {
         // Copy into a staging path, not `to` itself, so a rejected or
         // aborted copy never touches (e.g. partially overwrites) the real
         // destination object.
         let tmp_to = tmp_path_for(to);
-        let inner = self.inner.copy(ctx, from, &tmp_to, args, opts)?;
+        let inner = self.inner.copy(ctx, from, &tmp_to, args)?;
 
         Ok(QuotaCopier {
             inner,

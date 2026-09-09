@@ -37,6 +37,8 @@ impl Service for ReadOnlyService {
     type Lister = oio::Lister;
     type Deleter = oio::Deleter;
     type Copier = oio::Copier;
+    type Composer = oio::Composer;
+
     fn info(&self) -> ServiceInfo {
         self.inner.info()
     }
@@ -89,7 +91,6 @@ impl Service for ReadOnlyService {
         from: &str,
         to: &str,
         args: OpCopy,
-        opts: OpCopier,
     ) -> Result<Self::Copier> {
         Err(
             Error::new(ErrorKind::PermissionDenied, "read-only mount point")
@@ -117,5 +118,29 @@ impl Service for ReadOnlyService {
         args: OpPresign,
     ) -> Result<RpPresign> {
         self.inner.presign(ctx, path, args).await
+    }
+
+    fn compose(
+        &self,
+        _ctx: &OperationContext,
+        _to: &str,
+        _args: OpCompose,
+    ) -> Result<Self::Composer> {
+        Err(
+            Error::new(ErrorKind::PermissionDenied, "read-only mount point")
+                .with_context("layer", "ReadOnlyLayer"),
+        )
+    }
+
+    async fn restore(
+        &self,
+        _ctx: &OperationContext,
+        _path: &str,
+        _args: OpRestore,
+    ) -> Result<RpRestore> {
+        Err(
+            Error::new(ErrorKind::PermissionDenied, "read-only mount point")
+                .with_context("layer", "ReadOnlyLayer"),
+        )
     }
 }

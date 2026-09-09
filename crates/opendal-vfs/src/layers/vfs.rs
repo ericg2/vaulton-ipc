@@ -22,7 +22,8 @@ use crate::writer::MountWriter;
 use opendal_core::raw::oio::OneShotCopier;
 use opendal_core::raw::*;
 use opendal_core::{
-    Builder, Capability, EntryMode, Error, ErrorKind, Metadata, OperationContext, Operator, Result,
+    Builder, Capability, EntryMode, Error, ErrorKind, Metadata, MetadataBuilder, OperationContext,
+    Operator, Result,
 };
 
 /// A not-yet-built mount, held inside [`VfsBuilder`].
@@ -230,12 +231,16 @@ impl MountAccess {
     async fn metadata(&self, path: &str) -> Result<Metadata> {
         if let Some((mount_path, mount, rel)) = crate::resolve_path(&self.mounts, path) {
             if crate::normalize(path) == mount_path && rel.is_empty() {
-                Ok(Metadata::new(EntryMode::DIR))
+                let mut meta = MetadataBuilder::dir();
+                meta.last_modified(Timestamp::from_second(0).unwrap());
+                Ok(meta.build())
             } else {
                 mount.operator.stat(&rel).await
             }
         } else if virtual_children(&self.mounts, path).is_some() {
-            Ok(Metadata::new(EntryMode::DIR))
+            let mut meta = MetadataBuilder::dir();
+            meta.last_modified(Timestamp::from_second(0).unwrap());
+            Ok(meta.build())
         } else {
             Err(Error::new(ErrorKind::NotFound, "path not found"))
         }
@@ -248,6 +253,7 @@ impl Service for MountAccess {
     type Lister = MountLister;
     type Deleter = MountDeleter;
     type Copier = OneShotCopier;
+    type Composer = ();
 
     fn info(&self) -> ServiceInfo {
         ServiceInfo::new("mount", "/", "mount")
@@ -362,11 +368,10 @@ impl Service for MountAccess {
                             format!("{}/{name}/", base.trim_start_matches('/'))
                         };
 
-                        oio::Entry::new(
-                            &full,
-                            Metadata::new(EntryMode::DIR)
-                                .with_last_modified(Timestamp::from_second(0).unwrap()),
-                        )
+                        let mut  meta = MetadataBuilder::dir();
+                        meta.last_modified(Timestamp::from_second(0).unwrap());
+
+                        oio::Entry::new(&full, meta.build())
                     })
                     .collect();
 
@@ -392,7 +397,6 @@ impl Service for MountAccess {
         from: &str,
         to: &str,
         _args: OpCopy,
-        _opts: OpCopier,
     ) -> Result<Self::Copier> {
         let Some((from_path, from_mount, from_rel)) = crate::resolve_path(&self.mounts, from)
         else {

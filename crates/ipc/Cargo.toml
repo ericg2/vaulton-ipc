@@ -29,7 +29,7 @@ rustic_backend = { git = "https://github.com/ericg2/rustic_core.git" }
 rustic_core = { git = "https://github.com/ericg2/rustic_core.git" }
 opendal-vfs = { path = "../opendal-vfs" }
 
-unftp-sbe-opendal = "=0.4.5"
+unftp-sbe-opendal = "0.4"
 libunftp = { version = "0.23.0", features = ["aws_lc_rs"] }
 unftp-core = "0.1.0"
 
@@ -37,7 +37,7 @@ async-trait = "0.1.89"
 dashmap = "6.2.1"
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "sqlite-bundled"] }
 futures-lite = "2.6.1"
-opendal-core = "0.58.2"
+opendal-core = { version = "0.59", features = ["blocking"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
