@@ -356,7 +356,7 @@ where
                 &BackupOptions::default(),
                 &source,
                 snap,
-                PathList::from(args.source_path),
+                PathList::from_string(&*args.source_path)?,
                 token,
             )?;
             Ok(Some(saved.id.to_string()))

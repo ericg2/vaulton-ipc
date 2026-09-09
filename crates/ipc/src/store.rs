@@ -213,11 +213,11 @@ impl StorageManager {
         if point.read_only {
             op = op.layer(ReadOnlyLayer);
         } else if let Some(max) = point.max_bytes {
-            op = op.layer(QuotaLayer::new(
-                self.state.clone(),
-                utils::quota_id(&user.username, &point.name),
-                max,
-            ));
+            // op = op.layer(QuotaLayer::new(
+            //     self.state.clone(),
+            //     utils::quota_id(&user.username, &point.name),
+            //     max,
+            // ));
         }
 
         Ok(op)
