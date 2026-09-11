@@ -38,15 +38,8 @@ pub fn opt_ts(dt: Option<Zoned>) -> Option<Timestamp> {
 
 // ── Domain conversions ────────────────────────────────────────────────────────
 
-/// Converts a [`Path`] into an OpenDAL-supported [`String`].
-///
-/// # Arguments
-/// * `base` - The root [`Path`] to use.
-/// * `p` - The [`Path`] to convert from.
-/// * `is_dir` - If representing a directory or file.
-///
-/// # Returns
-/// A valid [`String`] for OpenDAL use.
+/// Normalizes `p` into an OpenDAL-style absolute path (leading `/`, and a
+/// trailing `/` iff `is_dir`).
 pub fn fix_path(p: impl AsRef<Path>, is_dir: bool) -> String {
     let mut r = p.as_ref().to_string_lossy().to_string();
     if !r.starts_with("/") {
@@ -116,10 +109,7 @@ fn find_point<'a>(user: &'a VfsUser, name: &str) -> Result<&'a VfsPoint, Status>
 }
 
 /// Locates `repo_name` among `user`'s mounts and confirms it's a repo point.
-pub fn require_repo_point<'a>(
-    user: &'a VfsUser,
-    repo_name: &str,
-) -> Result<&'a VfsPoint, Status> {
+pub fn require_repo_point<'a>(user: &'a VfsUser, repo_name: &str) -> Result<&'a VfsPoint, Status> {
     let point = find_point(user, repo_name)?;
     if !point.is_repo {
         return Err(Status::invalid_argument(format!(
@@ -130,10 +120,7 @@ pub fn require_repo_point<'a>(
 }
 
 /// Locates `point_name` among `user`'s mounts and confirms it's a data point.
-pub fn require_data_point<'a>(
-    user: &'a VfsUser,
-    point_name: &str,
-) -> Result<&'a VfsPoint, Status> {
+pub fn require_data_point<'a>(user: &'a VfsUser, point_name: &str) -> Result<&'a VfsPoint, Status> {
     let point = find_point(user, point_name)?;
     if point.is_repo {
         return Err(Status::invalid_argument(format!(
@@ -160,13 +147,32 @@ pub fn require_writable(point: &VfsPoint) -> Result<(), Status> {
     }
 }
 
+/// Whether `scheme` should be backed up via [`LocalSource`](rustic_backend::local::LocalSource)
+/// instead of an OpenDAL operator.
+pub fn is_local_scheme(scheme: &str) -> bool {
+    matches!(scheme.to_ascii_lowercase().as_str(), "local" | "fs")
+}
+
+/// Filesystem path for a local-scheme data point, read from its `root` or
+/// `path` config option.
+pub fn local_source_path(point: &VfsPoint) -> Result<String, Status> {
+    point
+        .config
+        .get("root")
+        .or_else(|| point.config.get("path"))
+        .cloned()
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "point '{}' uses scheme '{}' but has no 'root' or 'path' option",
+                point.name, point.scheme
+            ))
+        })
+}
+
 /// Builds the [`RepoSource`] needed to open a repo point's rustic backend.
 pub fn repo_source(point: &VfsPoint) -> Result<RepoSource, Status> {
     let password = point.repo_password.clone().ok_or_else(|| {
-        Status::invalid_argument(format!(
-            "repo point '{}' is missing a password",
-            point.name
-        ))
+        Status::invalid_argument(format!("repo point '{}' is missing a password", point.name))
     })?;
 
     Ok(RepoSource {
@@ -231,10 +237,9 @@ pub fn resolve_data_path<'a>(
         )));
     }
 
-    let point_name = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Status::invalid_argument(format!("path '{vfs_path}' is missing a point name")))?;
+    let point_name = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
+        Status::invalid_argument(format!("path '{vfs_path}' is missing a point name"))
+    })?;
 
     let rest = parts.next().unwrap_or("");
     let point = require_data_point(user, point_name)?;
@@ -392,6 +397,28 @@ mod tests {
     fn resolve_data_path_rejects_unknown_point() {
         let u = user(vec![data_point("local", false)]);
         assert!(resolve_data_path(&u, "/points/ghost/x").is_err());
+    }
+
+    #[test]
+    fn is_local_scheme_matches_local_and_fs() {
+        assert!(is_local_scheme("local"));
+        assert!(is_local_scheme("FS"));
+        assert!(!is_local_scheme("s3"));
+    }
+
+    #[test]
+    fn local_source_path_prefers_root_then_path() {
+        let mut p = data_point("d", false);
+        p.config.insert("path".into(), "/data".into());
+        assert_eq!(local_source_path(&p).unwrap(), "/data");
+        p.config.insert("root".into(), "/root-data".into());
+        assert_eq!(local_source_path(&p).unwrap(), "/root-data");
+    }
+
+    #[test]
+    fn local_source_path_requires_root_or_path() {
+        let p = data_point("d", false);
+        assert!(local_source_path(&p).is_err());
     }
 
     #[test]

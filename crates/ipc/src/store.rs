@@ -99,8 +99,7 @@ pub struct RepoSource {
 /// | Cache      | Key          | Value              | Purpose                |
 /// |------------|--------------|--------------------|------------------------|
 /// | `repos`    | `RepoSource` | `Arc<RepoIndexed>` | Indexed rustic repos   |
-/// | `vfs_ops`  | `RepoSource` | `Arc<Operator>`    | VFS OpenDAL operators  |
-/// | `data_ops` | `Scheme`     | `Arc<Operator>`    | Data-layer operators   |
+/// | `vfs_ops`  | `VfsUser`    | `Operator`         | Per-user VFS operators |
 #[derive(Clone)]
 pub struct StorageManager {
     repos: Cache<RepoSource, Arc<RepoIndexed>>,
@@ -213,11 +212,11 @@ impl StorageManager {
         if point.read_only {
             op = op.layer(ReadOnlyLayer);
         } else if let Some(max) = point.max_bytes {
-            // op = op.layer(QuotaLayer::new(
-            //     self.state.clone(),
-            //     utils::quota_id(&user.username, &point.name),
-            //     max,
-            // ));
+            op = op.layer(QuotaLayer::new(
+                self.state.clone(),
+                utils::quota_id(&user.username, &point.name),
+                max,
+            ));
         }
 
         Ok(op)
@@ -332,7 +331,6 @@ impl StorageSystem for StorageManager {
         let x = opendal_core::blocking::Operator::new(op)?;
         Ok(x)
     }
-
 }
 
 // ---------------------------------------------------------------------------

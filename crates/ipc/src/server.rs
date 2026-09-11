@@ -4,8 +4,9 @@ use crossbeam_channel as chan;
 use dashmap::DashMap;
 use log::warn;
 use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
+use rustic_backend::local::LocalSource;
 use rustic_backend::opendal::OpenDALSource;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tonic::{Request, Response, Status};
@@ -192,6 +193,14 @@ fn chrono_to_ts(ts: opendal_core::raw::Timestamp) -> prost_types::Timestamp {
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
+/// A running job's cancel handle plus the username it runs on behalf of, so
+/// `set_vfs` can cancel jobs whose user's VFS config just changed underneath
+/// them.
+struct JobHandle {
+    token: CancelToken,
+    user: String,
+}
+
 struct Inner<S, U>
 where
     S: StorageSystem,
@@ -200,7 +209,7 @@ where
     storage: Arc<S>,
     users: Arc<U>,
     quota: QuotaState,
-    jobs: DashMap<Uuid, CancelToken>,
+    jobs: DashMap<Uuid, JobHandle>,
     events: StdMutex<VecDeque<JobEvent>>,
 }
 
@@ -250,13 +259,13 @@ where
         self.inner.users.get_user(&user).await.map_err(map_vfs)
     }
 
-    /// Spawn a background job and return its ID immediately.
+    /// Spawn a background job owned by `user` and return its ID immediately.
     ///
     /// The closure runs inside `spawn_blocking` so it may call blocking rustic
     /// APIs freely. For async `StorageSystem` methods (e.g. `get_repo_job`),
     /// use `Handle::current().block_on(...)` inside the closure — this is safe
     /// because `spawn_blocking` threads are not async-task threads.
-    fn spawn_job<F>(&self, f: F) -> String
+    fn spawn_job<F>(&self, user: impl Into<String>, f: F) -> String
     where
         F: FnOnce(
                 Uuid,
@@ -269,7 +278,13 @@ where
         let job_id = Uuid::new_v4();
         let token = CancelToken::new();
         let (tx, rx) = chan::unbounded::<Data>();
-        self.inner.jobs.insert(job_id, token.clone());
+        self.inner.jobs.insert(
+            job_id,
+            JobHandle {
+                token: token.clone(),
+                user: user.into(),
+            },
+        );
         {
             // Bridge thread — drains crossbeam channel into the async-safe
             // event buffer using std::Mutex, never touching the tokio runtime.
@@ -328,14 +343,28 @@ where
         // fail once it's already running.
         let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
         utils::require_writable(repo_point)?;
-        let repo_src = utils::repo_source(repo_point)?;
 
+        let repo_src = utils::repo_source(repo_point)?;
         let data_point = utils::require_data_point(&user, &args.data_name)?;
-        let source_op = self
-            .inner
-            .storage
-            .get_data_operator(&user, data_point)
-            .map_err(map_vfs)?;
+
+        // Local/fs sources read straight off disk via `LocalSource`, bypassing
+        // the OpenDAL layer (and its quota tracking) entirely. Everything else
+        // still goes through `get_data_operator` as before.
+        let local_path = if utils::is_local_scheme(&data_point.scheme) {
+            Some(utils::local_source_path(data_point)?)
+        } else {
+            None
+        };
+        let source_op = if local_path.is_some() {
+            None
+        } else {
+            Some(
+                self.inner
+                    .storage
+                    .get_data_operator(&user, data_point)
+                    .map_err(map_vfs)?,
+            )
+        };
 
         let repo_op = self
             .inner
@@ -345,20 +374,29 @@ where
 
         let tags = args.tags;
         let storage = Arc::clone(&self.inner.storage);
+        let username = user.username.clone();
 
-        let job_id = self.spawn_job(move |job_id, tx, token| {
+        let job_id = self.spawn_job(username, move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
-            let source = OpenDALSource::new(source_op);
             let tags = StringList::from_str(&tags.join(",")).unwrap();
             let snap = SnapshotOptions::default().tags(vec![tags]).to_snapshot()?;
             let repo = handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?;
-            let saved = repo.backup_with(
-                &BackupOptions::default(),
-                &source,
-                snap,
-                PathList::from_string(&*args.source_path)?,
-                token,
-            )?;
+            let paths = PathList::from_string(&*args.source_path)?;
+
+            let saved = if let Some(path) = local_path {
+                let source = LocalSource::new(path);
+                repo.backup(snap)
+                    .add_multi(&source, paths.paths())
+                    .with_token(token)
+                    .run()?
+            } else {
+                let source = OpenDALSource::new(source_op.expect("non-local backup source"));
+                repo.backup(snap)
+                    .add_multi(&source, paths.paths())
+                    .with_token(token)
+                    .run()?
+            };
+
             Ok(Some(saved.id.to_string()))
         });
 
@@ -396,10 +434,12 @@ where
         let delete = args.delete;
         let dry_run = args.dry_run;
         let storage = Arc::clone(&self.inner.storage);
+        let username = user.username.clone();
 
-        let job_id = self.spawn_job(move |job_id, tx, token| {
+        let job_id = self.spawn_job(username, move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
-            let repo = Arc::new(handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?);
+            let repo =
+                Arc::new(handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?);
             let dest = OpenDALSource::new(dest_op);
             let opts = RestoreOptions::default().delete(delete);
             let snap_path = format!("{}:{}", &snapshot_id, &snapshot_path);
@@ -436,8 +476,9 @@ where
             .map_err(map_vfs)?;
 
         let storage = Arc::clone(&self.inner.storage);
+        let username = user.username.clone();
 
-        let job_id = self.spawn_job(move |job_id, tx, _token| {
+        let job_id = self.spawn_job(username, move |job_id, tx, _token| {
             let handle = tokio::runtime::Handle::current();
             let repo = handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?;
             repo.check(CheckOptions::default())?;
@@ -473,8 +514,9 @@ where
             .collect::<Result<_, _>>()?;
 
         let storage = Arc::clone(&self.inner.storage);
+        let username = user.username.clone();
 
-        let job_id = self.spawn_job(move |job_id, tx, _token| {
+        let job_id = self.spawn_job(username, move |job_id, tx, _token| {
             let handle = tokio::runtime::Handle::current();
             let repo = handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?;
             repo.delete_snapshots(&snap_ids)?;
@@ -523,8 +565,8 @@ where
             .map_err(|e| Status::invalid_argument(format!("bad job_id: {e}")))?;
 
         match self.inner.jobs.get(&uuid) {
-            Some(token) => {
-                token.cancel();
+            Some(handle) => {
+                handle.token.cancel();
                 Ok(Response::new(JobCancelResponse {
                     job_id: args.job_id,
                 }))
@@ -596,11 +638,21 @@ where
             }
         }
 
-        // Update the database first. If this fails, don't invalidate caches or
-        // remove quota state.
+        // Update the database first. If this fails, don't cancel jobs,
+        // invalidate caches, or remove quota state.
         self.inner.users.set_users(users).await.map_err(map_vfs)?;
 
-        // Invalidate only users whose VFS configuration changed.
+        // Cancel any in-flight job belonging to a user whose VFS config just
+        // changed (including removal, and read_only/max_bytes edits) before
+        // touching caches, so no job keeps running against stale points.
+        let changed_usernames: HashSet<&str> =
+            changed_users.iter().map(|u| u.username.as_str()).collect();
+        for job in self.inner.jobs.iter() {
+            if changed_usernames.contains(job.user.as_str()) {
+                job.token.cancel();
+            }
+        }
+
         for user in changed_users {
             warn!(
                 "Detected change on user: {}. Invalidating...",
@@ -618,6 +670,31 @@ where
         }
 
         Ok(Response::new(Empty {}))
+    }
+
+    async fn get_vfs(&self, _request: Request<Empty>) -> Result<Response<InfoResponse>, Status> {
+        let users = self.inner.users.get_users().await.map_err(map_vfs)?;
+
+        let mut info = Vec::new();
+
+        for user in users {
+            for point in &user.points {
+                let used_bytes = self
+                    .inner
+                    .quota
+                    .current_bytes(&utils::quota_id(&user.username, &point.name))
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?;
+
+                info.push(crate::ipc::VfsInfo {
+                    user: user.username.clone(),
+                    point: Some(point.into()),
+                    used_bytes,
+                });
+            }
+        }
+
+        Ok(Response::new(InfoResponse { info }))
     }
 
     async fn vfs_read_file(
@@ -811,30 +888,5 @@ where
         }
 
         Ok(Response::new(Empty {}))
-    }
-
-    async fn get_vfs(&self, _request: Request<Empty>) -> Result<Response<InfoResponse>, Status> {
-        let users = self.inner.users.get_users().await.map_err(map_vfs)?;
-
-        let mut info = Vec::new();
-
-        for user in users {
-            for point in &user.points {
-                let used_bytes =
-                    self.inner
-                        .quota
-                        .current_bytes(&utils::quota_id(&user.username, &point.name))
-                        .await
-                        .map_err(|err| Status::internal(err.to_string()))?;
-
-                info.push(crate::ipc::VfsInfo {
-                    user: user.username.clone(),
-                    point: Some(point.into()),
-                    used_bytes,
-                });
-            }
-        }
-
-        Ok(Response::new(InfoResponse { info }))
     }
 }
