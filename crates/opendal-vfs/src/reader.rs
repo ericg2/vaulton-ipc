@@ -1,5 +1,5 @@
-use opendal_core::{Buffer, Metadata, Operator};
 use opendal_core::raw::oio;
+use opendal_core::{Buffer, Metadata, Operator};
 use tokio::sync::OnceCell;
 
 /// [`oio::Read`] implementation for a mounted path.

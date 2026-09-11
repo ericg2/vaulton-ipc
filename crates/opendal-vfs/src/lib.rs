@@ -1,14 +1,14 @@
-mod reader;
-mod lister;
 mod deleter;
+mod lister;
+mod reader;
 mod writer;
 
 pub mod layers;
 
 use std::collections::BTreeMap;
 
-pub use opendal_core::{Error, ErrorKind};
 use crate::layers::vfs::Mount;
+pub use opendal_core::{Error, ErrorKind};
 
 pub fn normalize(path: &str) -> String {
     let trimmed = path.trim_matches('/');

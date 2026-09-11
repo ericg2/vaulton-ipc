@@ -53,9 +53,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 
+use opendal_core::raw::oio::Delete;
 use opendal_core::raw::*;
 use opendal_core::*;
-use opendal_core::raw::oio::Delete;
 
 /// Default interval between background syncs to the [`QuotaTracker`].
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(30);
@@ -876,8 +876,7 @@ impl<W: oio::Write> oio::Write for QuotaWriter<W> {
         }
 
         // Commit accepted: move the finished write into place.
-        if let Err(err) =
-            commit_rename(&self.accessor, &self.ctx, &self.tmp_path, &self.path).await
+        if let Err(err) = commit_rename(&self.accessor, &self.ctx, &self.tmp_path, &self.path).await
         {
             // Roll back the quota commit so a failed rename doesn't leave
             // the counter permanently overstated. u64::MAX as the limit
@@ -1013,8 +1012,7 @@ impl<C: oio::Copy> oio::Copy for QuotaCopier<C> {
         }
 
         // Commit accepted: move the finished copy into place.
-        if let Err(err) = commit_rename(&self.accessor, &self.ctx, &self.tmp_to, &self.to).await
-        {
+        if let Err(err) = commit_rename(&self.accessor, &self.ctx, &self.tmp_to, &self.to).await {
             // Roll back the quota commit, same reasoning as QuotaWriter.
             let _ = self
                 .state

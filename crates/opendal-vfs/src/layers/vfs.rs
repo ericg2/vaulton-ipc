@@ -368,7 +368,7 @@ impl Service for MountAccess {
                             format!("{}/{name}/", base.trim_start_matches('/'))
                         };
 
-                        let mut  meta = MetadataBuilder::dir();
+                        let mut meta = MetadataBuilder::dir();
                         meta.last_modified(Timestamp::from_second(0).unwrap());
 
                         oio::Entry::new(&full, meta.build())
