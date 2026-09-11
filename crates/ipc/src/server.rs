@@ -32,7 +32,7 @@ use opendal_vfs::layers::quota::{QuotaState, QuotaTracker};
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
 use rustic_core::{
-    BackupOptions, CancelToken, CheckOptions, LsOptions, PathList, RestoreOptions, SnapshotOptions,
+    CancelToken, CheckOptions, LsOptions, PathList, RestoreOptions, SnapshotOptions,
     StringList,
 };
 
