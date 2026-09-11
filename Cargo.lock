@@ -4197,7 +4197,7 @@ dependencies = [
 [[package]]
 name = "rustic_backend"
 version = "0.8.0"
-source = "git+https://github.com/ericg2/rustic_core.git#59dfbf8131a97562ece8767fb406e5512a70ab65"
+source = "git+https://github.com/ericg2/rustic_core.git#6c58efa68aae255db8c8b2d9a611b29e2eb15b12"
 dependencies = [
  "aho-corasick",
  "backon",
@@ -4239,7 +4239,7 @@ checksum = "fbcebf2228827bc4b61cb54dfd84cf43aacf06ca2dfe4c014b136a0e32b876e2"
 [[package]]
 name = "rustic_core"
 version = "0.14.0"
-source = "git+https://github.com/ericg2/rustic_core.git#59dfbf8131a97562ece8767fb406e5512a70ab65"
+source = "git+https://github.com/ericg2/rustic_core.git#6c58efa68aae255db8c8b2d9a611b29e2eb15b12"
 dependencies = [
  "aes256ctr_poly1305aes",
  "aho-corasick",
@@ -4769,9 +4769,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.16.0"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 dependencies = [
  "serde",
 ]

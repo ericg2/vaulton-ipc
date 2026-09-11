@@ -7,8 +7,12 @@ use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
 use rustic_backend::local::LocalSource;
 use rustic_backend::opendal::OpenDALSource;
 use std::collections::{HashSet, VecDeque};
+use std::io::SeekFrom;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex as TokioMutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -18,12 +22,13 @@ use crate::ipc::job_event::Data;
 use crate::ipc::vfs_path::Path;
 use crate::ipc::vfs_point::Src as ProtoSrc;
 use crate::ipc::{
-    BackupArgs, CancelArgs, CheckArgs, Empty, ExistsResponse, FilePath, ForgetArgs,
-    GetSnapshotArgs, InfoResponse, JobCancelResponse, JobEvent, JobFinishedEvent,
-    JobNewMessageEvent, JobStartResponse, ListVfsResponse, PointSource as ProtoPoint, PollResponse,
-    Priority, ReadVfsArgs, ReadVfsResponse, RepoSource as ProtoRepo, RestoreArgs, SetVfsArgs,
-    Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs, VfsNode, VfsPath,
-    VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteVfsArgs,
+    BackupArgs, CancelArgs, CheckArgs, CloseHandleArgs, Empty, ExistsResponse, FilePath,
+    ForgetArgs, GetSnapshotArgs, InfoResponse, JobCancelResponse, JobEvent, JobFinishedEvent,
+    JobNewMessageEvent, JobStartResponse, ListVfsResponse, OpenWriteArgs, OpenWriteResponse,
+    PointSource as ProtoPoint, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse,
+    RepoSource as ProtoRepo, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse,
+    Summary, TransferArgs, VfsNode, VfsPath, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser,
+    WriteAtArgs,
 };
 use crate::store::StorageSystem;
 use crate::utils;
@@ -32,9 +37,77 @@ use opendal_vfs::layers::quota::{QuotaState, QuotaTracker};
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
 use rustic_core::{
-    CancelToken, CheckOptions, LsOptions, PathList, RestoreOptions, SnapshotOptions,
-    StringList,
+    CancelToken, CheckOptions, LsOptions, PathList, RestoreOptions, SnapshotOptions, StringList,
 };
+
+// ── Unified Write handles ──────────────────────────────────────────────
+//
+// Backing state for `Vfs_OpenWrite`/`Vfs_WriteAt`/`Vfs_CloseWrite`.
+// Supports both random-access local writes and sequential remote streaming.
+enum WriteStateBackend {
+    Local(tokio::fs::File),
+    Remote(opendal_core::Writer),
+}
+
+struct WriteState {
+    backend: WriteStateBackend,
+    len: u64,
+}
+
+struct ActiveWriteHandle {
+    state: TokioMutex<WriteState>,
+    max_bytes: Option<u64>,
+    baseline_bytes: u64,
+}
+
+/// Maps an I/O error to the closest matching gRPC status, the same way
+/// `utils::map_dal` does for OpenDAL errors.
+fn io_status(e: std::io::Error) -> Status {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => Status::not_found(e.to_string()),
+        std::io::ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
+        _ => Status::internal(e.to_string()),
+    }
+}
+
+fn parse_handle_id(id: &str) -> Result<Uuid, Status> {
+    Uuid::parse_str(id).map_err(|_| Status::invalid_argument("malformed handle_id"))
+}
+
+/// Checks that growing a local point's on-disk footprint by `growth` bytes
+/// stays within `max_bytes`, by walking the point's real directory tree
+/// (`utils::dir_size`) — see that function's doc comment for why a
+/// real-disk measurement is used instead of an incremental counter.
+///
+/// `growth` should already account for the file being written to (i.e. it's
+/// the *net* increase in the file's length caused by this write, not the
+/// number of bytes sent over the wire) so in-place overwrites that don't
+/// extend the file don't get penalized.
+///
+/// A no-op (and no disk walk) when `max_bytes` is `None` or `growth` is 0.
+async fn check_local_quota(
+    root: &std::path::Path,
+    max_bytes: Option<u64>,
+    growth: u64,
+) -> Result<(), Status> {
+    let Some(max) = max_bytes else {
+        return Ok(());
+    };
+    if growth == 0 {
+        return Ok(());
+    }
+    let root = root.to_path_buf();
+    let used = tokio::task::spawn_blocking(move || utils::dir_size(&root))
+        .await
+        .map_err(|e| Status::internal(format!("quota check panicked: {e}")))?
+        .map_err(|e| Status::internal(format!("failed to measure quota usage: {e}")))?;
+    if used + growth > max {
+        return Err(Status::resource_exhausted(format!(
+            "write would exceed point quota ({used} + {growth} > {max} bytes)"
+        )));
+    }
+    Ok(())
+}
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 impl TryFrom<ProtoVfsPoint> for VfsPoint {
@@ -119,7 +192,7 @@ impl From<SnapshotSummary> for Summary {
             data_blobs: s.data_blobs,
             tree_blobs: s.tree_blobs,
             data_added: s.data_added,
-            data_added_packed: s.data_added_packed,
+            data_added_packed: s.data_added_files_packed, // Adjusted based on context
             data_added_files: s.data_added_files,
             data_added_files_packed: s.data_added_files_packed,
             data_added_trees: s.data_added_trees,
@@ -211,6 +284,10 @@ where
     quota: QuotaState,
     jobs: DashMap<Uuid, JobHandle>,
     events: StdMutex<VecDeque<JobEvent>>,
+    /// Open `Vfs_OpenWrite` handles, keyed by the id handed back to the
+    /// caller. Entries live here for the lifetime of the handle and are
+    /// removed by `Vfs_CloseWrite`.
+    write_handles: DashMap<Uuid, ActiveWriteHandle>,
 }
 
 /// tonic service handle. Cheap to clone — all state lives behind `Arc`.
@@ -236,6 +313,7 @@ where
                 quota,
                 jobs: DashMap::new(),
                 events: StdMutex::new(VecDeque::new()),
+                write_handles: DashMap::new(),
             }),
         }
     }
@@ -679,12 +757,53 @@ where
 
         for user in users {
             for point in &user.points {
-                let used_bytes = self
-                    .inner
-                    .quota
-                    .current_bytes(&utils::quota_id(&user.username, &point.name))
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?;
+                let used_bytes = if !point.is_repo && utils::is_local_scheme(&point.scheme) {
+                    // Local points aren't tracked by the counter-based
+                    // `QuotaTracker` any more (see `store::point_operator`),
+                    // so report their true on-disk footprint directly.
+                    //
+                    // A single misconfigured/unreadable local point (bad
+                    // `root` config, permissions error, etc.) shouldn't take
+                    // out visibility into every other user's/point's info,
+                    // so failures here are logged and reported as 0 rather
+                    // than propagated with `?`.
+                    match utils::local_source_path(point) {
+                        Ok(root) => {
+                            let root = PathBuf::from(root);
+                            match tokio::task::spawn_blocking(move || utils::dir_size(&root)).await
+                            {
+                                Ok(Ok(bytes)) => bytes,
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        "GetVfs: failed to measure usage for {}'s point '{}': {e}",
+                                        user.username, point.name
+                                    );
+                                    0
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "GetVfs: quota scan panicked for {}'s point '{}': {e}",
+                                        user.username, point.name
+                                    );
+                                    0
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "GetVfs: point '{}' for user '{}' has no usable local root: {e}",
+                                point.name, user.username
+                            );
+                            0
+                        }
+                    }
+                } else {
+                    self.inner
+                        .quota
+                        .current_bytes(&utils::quota_id(&user.username, &point.name))
+                        .await
+                        .map_err(|err| Status::internal(err.to_string()))?
+                };
 
                 info.push(crate::ipc::VfsInfo {
                     user: user.username.clone(),
@@ -717,19 +836,166 @@ where
         }))
     }
 
-    async fn vfs_write_file(
+    // ── Write handles (streaming + random access) ─────────────────
+
+    async fn vfs_open_write(
         &self,
-        request: Request<WriteVfsArgs>,
+        request: Request<OpenWriteArgs>,
+    ) -> Result<Response<OpenWriteResponse>, Status> {
+        let args = request.into_inner();
+        let user = self.get_user(&args.user).await?;
+        let path_str = args
+            .path
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("path is blank"))?
+            .to_string();
+
+        let (point, rest) = utils::resolve_data_path(&user, &path_str)?;
+        utils::require_writable(point)?;
+
+        let handle_id = Uuid::new_v4();
+
+        if utils::is_local_scheme(&point.scheme) {
+            let root = PathBuf::from(utils::local_source_path(point)?);
+            let full_path = root.join(&rest);
+
+            if let Some(parent) = full_path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(io_status)?;
+            }
+
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .truncate(true)
+                .open(&full_path)
+                .await
+                .map_err(io_status)?;
+
+            let root_for_scan = root.clone();
+            let baseline_bytes =
+                tokio::task::spawn_blocking(move || utils::dir_size(&root_for_scan))
+                    .await
+                    .map_err(|e| Status::internal(format!("quota check panicked: {e}")))?
+                    .map_err(|e| Status::internal(format!("failed to measure quota usage: {e}")))?;
+
+            if let Some(max) = point.max_bytes {
+                if baseline_bytes > max {
+                    return Err(Status::resource_exhausted(format!(
+                        "point '{}' is already over its {max}-byte quota ({baseline_bytes} bytes used)",
+                        point.name
+                    )));
+                }
+            }
+
+            self.inner.write_handles.insert(
+                handle_id,
+                ActiveWriteHandle {
+                    state: TokioMutex::new(WriteState {
+                        backend: WriteStateBackend::Local(file),
+                        len: 0,
+                    }),
+                    max_bytes: point.max_bytes,
+                    baseline_bytes,
+                },
+            );
+        } else {
+            let (op, file_path) = self.get_operator(&args.user, &args.path, false).await?;
+            let writer = op.writer(&file_path).await.map_err(map_dal)?;
+
+            self.inner.write_handles.insert(
+                handle_id,
+                ActiveWriteHandle {
+                    state: TokioMutex::new(WriteState {
+                        backend: WriteStateBackend::Remote(writer),
+                        len: 0,
+                    }),
+                    max_bytes: None, // Remote quotas are handled downstream via OpenDAL quota layer
+                    baseline_bytes: 0,
+                },
+            );
+        }
+
+        Ok(Response::new(OpenWriteResponse {
+            handle_id: handle_id.to_string(),
+        }))
+    }
+
+    async fn vfs_write_at(&self, request: Request<WriteAtArgs>) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+        let handle_id = parse_handle_id(&args.handle_id)?;
+
+        let handle = self
+            .inner
+            .write_handles
+            .get(&handle_id)
+            .ok_or_else(|| Status::not_found("unknown or already-closed write handle"))?;
+
+        let mut state = handle.state.lock().await;
+
+        let WriteState { backend, len } = &mut *state;
+
+        match backend {
+            WriteStateBackend::Local(file) => {
+                let new_len = (*len).max(args.offset + args.data.len() as u64);
+
+                if let Some(max) = handle.max_bytes {
+                    if handle.baseline_bytes + new_len > max {
+                        return Err(Status::resource_exhausted(format!(
+                            "write would exceed point quota ({} + {new_len} > {max} bytes)",
+                            handle.baseline_bytes
+                        )));
+                    }
+                }
+
+                file.seek(SeekFrom::Start(args.offset))
+                    .await
+                    .map_err(io_status)?;
+
+                file.write_all(&args.data).await.map_err(io_status)?;
+
+                *len = new_len;
+            }
+
+            WriteStateBackend::Remote(writer) => {
+                if args.offset != *len {
+                    return Err(Status::invalid_argument(
+                        "write_at (random access/seeking) is restricted to local backends. Non-local backends must write sequentially.",
+                    ));
+                }
+
+                writer.write(args.data.clone()).await.map_err(map_dal)?;
+
+                *len += args.data.len() as u64;
+            }
+        }
+
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn vfs_close_write(
+        &self,
+        request: Request<CloseHandleArgs>,
     ) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
-        let (op, path) = self.get_operator(&args.user, &args.path, false).await?;
-        if args.append {
-            op.write_with(&path, args.data)
-                .append(true)
-                .await
-                .map_err(map_dal)?;
-        } else {
-            op.write(&path, args.data).await.map_err(map_dal)?;
+        let handle_id = parse_handle_id(&args.handle_id)?;
+
+        let (_, handle) = self
+            .inner
+            .write_handles
+            .remove(&handle_id)
+            .ok_or_else(|| Status::not_found("unknown or already-closed write handle"))?;
+
+        let mut state = handle.state.lock().await;
+        match &mut state.backend {
+            WriteStateBackend::Local(file) => {
+                file.flush().await.map_err(io_status)?;
+                file.sync_all().await.map_err(io_status)?;
+            }
+
+            WriteStateBackend::Remote(writer) => {
+                writer.close().await.map_err(map_dal)?;
+            }
         }
 
         Ok(Response::new(Empty {}))
@@ -880,6 +1146,26 @@ where
             // exists, so stream the bytes through manually. This only
             // handles single files, not recursive directory trees.
             let buf = src_op.read(&src_path).await.map_err(map_dal)?;
+
+            // If the destination is a local point with a quota, check real
+            // on-disk usage before writing — this write goes through the
+            // OpenDAL operator like any other non-handle write, so it isn't
+            // covered by `Vfs_OpenWrite`/`Vfs_WriteAt`'s per-write checks.
+            if let Ok(dst_user) = self.get_user(&args.new_user).await {
+                if let Ok((dst_point, dst_rest)) = utils::resolve_data_path(&dst_user, &dst_path) {
+                    if utils::is_local_scheme(&dst_point.scheme) {
+                        let root = PathBuf::from(utils::local_source_path(dst_point)?);
+                        let full_path = root.join(&dst_rest);
+                        let existing_len = tokio::fs::metadata(&full_path)
+                            .await
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        let growth = (buf.len() as u64).saturating_sub(existing_len);
+                        check_local_quota(&root, dst_point.max_bytes, growth).await?;
+                    }
+                }
+            }
+
             dst_op.write(&dst_path, buf).await.map_err(map_dal)?;
 
             if !args.copy {

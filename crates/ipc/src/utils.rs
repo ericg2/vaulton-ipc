@@ -153,6 +153,47 @@ pub fn is_local_scheme(scheme: &str) -> bool {
     matches!(scheme.to_ascii_lowercase().as_str(), "local" | "fs")
 }
 
+/// Recursively sums the size, in bytes, of every regular file under `root`.
+///
+/// This is how quota usage is measured for local/fs-backed data points,
+/// instead of the incremental write-counter [`QuotaTracker`](opendal_vfs::layers::quota::QuotaTracker)
+/// uses for every other backend. A counter drifts for local points because
+/// files can be overwritten in place or truncated — in particular by the
+/// `Vfs_OpenWrite`/`Vfs_WriteAt` random-write handles, which write straight
+/// to disk and never pass through an `Operator` a counting layer could
+/// observe. Walking the real directory tree is slower but always correct.
+///
+/// Synchronous and blocking — callers on an async runtime should run this
+/// inside `tokio::task::spawn_blocking`.
+///
+/// Symlinks are skipped (neither followed nor counted) to avoid cycles and
+/// double-counting; a missing `root` is treated as zero bytes rather than
+/// an error, since a point's directory may not have been created yet.
+pub fn dir_size(root: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                total += entry.metadata()?.len();
+            }
+        }
+    }
+
+    Ok(total)
+}
+
 /// Filesystem path for a local-scheme data point, read from its `root` or
 /// `path` config option.
 pub fn local_source_path(point: &VfsPoint) -> Result<String, Status> {

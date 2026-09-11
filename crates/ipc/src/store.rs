@@ -211,11 +211,29 @@ impl StorageManager {
         if point.read_only {
             op = op.layer(ReadOnlyLayer);
         } else if let Some(max) = point.max_bytes {
-            op = op.layer(QuotaLayer::new(
-                self.state.clone(),
-                utils::quota_id(&user.username, &point.name),
-                max,
-            ));
+            // Local/fs-backed *data* points are quota-checked against
+            // their true on-disk footprint (`utils::dir_size`) directly by
+            // the IPC write handlers and by `FtpServer::put` in `ftp.rs`,
+            // instead of through this incremental write-counter layer.
+            // Skip it here so the two accounting mechanisms don't both
+            // apply (and disagree) for the same point — see
+            // `utils::dir_size` for why the counter isn't trustworthy for
+            // data points any more.
+            //
+            // Repo points are excluded from that switch even when they're
+            // also local/fs-backed: their content is written by rustic
+            // during backup jobs (`get_data_operator`, not the
+            // `Vfs_OpenWrite`/`Vfs_WriteAt` handles or `Vfs_WriteFile`), so
+            // there's no code path that would ever perform a `dir_size`
+            // check for them — leaving the counter attached here is the
+            // only enforcement they get.
+            if point.is_repo || !utils::is_local_scheme(&point.scheme) {
+                op = op.layer(QuotaLayer::new(
+                    self.state.clone(),
+                    utils::quota_id(&user.username, &point.name),
+                    max,
+                ));
+            }
         }
 
         Ok(op)

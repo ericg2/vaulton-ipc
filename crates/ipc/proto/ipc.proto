@@ -242,11 +242,44 @@ message ReadVfsResponse {
   bytes data = 1;
 }
 
-message WriteVfsArgs {
+// Opens a write handle on `path`. Supported for all backends.
+// For local/fs-backed points, this allows random-access via Vfs_WriteAt.
+// For non-local points, writes via Vfs_WriteAt must be sequential (like a stream).
+//
+// Opening always starts the file from empty (equivalent to O_TRUNC): any
+// existing content at `path` is discarded immediately, not on first write.
+// Use Vfs_WriteAt to fill it in, then Vfs_CloseWrite to finish and release
+// the handle. A handle that's never closed will hang around for the
+// lifetime of the server process, so callers (e.g. an SMB layer) should
+// always close on every code path, including errors/aborted transfers.
+message OpenWriteArgs {
   string user = 1;
   VfsPath path = 2;
+}
+
+message OpenWriteResponse {
+  // Opaque handle id (a UUID) to pass to Vfs_WriteAt / Vfs_CloseWrite.
+  string handle_id = 1;
+}
+
+// Writes `data` at byte offset `offset` into the file behind `handle_id`,
+// as returned by Vfs_OpenWrite. For local backends, writing past the current end
+// of the file extends it (the gap is zero-filled). Writes may be issued in any order.
+// For non-local backends, the offset must match the current file length exactly
+// (strictly sequential writes).
+message WriteAtArgs {
+  string handle_id = 1;
+  uint64 offset = 2;
   bytes data = 3;
-  bool append = 4;
+}
+
+// Flushes and closes a handle opened by Vfs_OpenWrite. The handle id is no
+// longer valid after this call. Closing is required for the write to be
+// durable and for the point's quota accounting to see the final file size;
+// closing a handle twice, or one that's already expired/unknown, returns
+// NOT_FOUND.
+message CloseHandleArgs {
+  string handle_id = 1;
 }
 
 message FilePath {
@@ -289,8 +322,14 @@ service IpcService {
   rpc GetVfs(Empty) returns (InfoResponse);
 
   rpc Vfs_ReadFile(ReadVfsArgs) returns (ReadVfsResponse);
-  rpc Vfs_WriteFile(WriteVfsArgs) returns (Empty);
   rpc Vfs_TouchFile(FilePath) returns (Empty);
+
+  // Write handles for both random-access (local) and streaming (remote).
+  // Typical sequence: Vfs_OpenWrite once, Vfs_WriteAt any
+  // number of times, then Vfs_CloseWrite once.
+  rpc Vfs_OpenWrite(OpenWriteArgs) returns (OpenWriteResponse);
+  rpc Vfs_WriteAt(WriteAtArgs) returns (Empty);
+  rpc Vfs_CloseWrite(CloseHandleArgs) returns (Empty);
 
   rpc Vfs_ListDir(FilePath) returns (ListVfsResponse);
   rpc Vfs_CreateDir(FilePath) returns (Empty);
