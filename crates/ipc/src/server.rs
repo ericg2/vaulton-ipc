@@ -6,7 +6,7 @@ use log::warn;
 use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
 use rustic_backend::local::LocalSource;
 use rustic_backend::opendal::OpenDALSource;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -114,14 +114,20 @@ impl TryFrom<ProtoVfsPoint> for VfsPoint {
     type Error = Status;
 
     fn try_from(p: ProtoVfsPoint) -> Result<Self, Status> {
-        let (scheme, config, is_repo, repo_password) = match p.src {
-            Some(ProtoSrc::Data(ps)) => (ps.scheme, ps.config, false, None),
+        let (scheme, root, mut config, is_repo, repo_password) = match p.src {
+            Some(ProtoSrc::Data(ps)) => (ps.scheme, ps.root, ps.config, false, None),
             Some(ProtoSrc::Repo(rs)) => match rs.src {
                 None => return Err(Status::invalid_argument("VfsPoint[repo].src is required")),
-                Some(x) => (x.scheme, x.config, true, Some(rs.password)),
+                Some(x) => (x.scheme, x.root, x.config, true, Some(rs.password)),
             },
             None => return Err(Status::invalid_argument("VfsPoint.src is required")),
         };
+
+        // Attempt to add the ROOT from the point!
+        if !root.is_empty() {
+            config.remove("root");
+            config.insert("root".into(), root);
+        }
 
         Ok(VfsPoint {
             name: p.name,
@@ -140,6 +146,7 @@ impl From<&VfsPoint> for ProtoVfsPoint {
         let p = ProtoPoint {
             scheme: point.scheme.clone(),
             config: point.config.clone().into_iter().collect(),
+            root: point.config.get("root").unwrap_or(&String::new()).to_string(),
         };
 
         let src = if point.is_repo {
@@ -958,7 +965,7 @@ where
             }
 
             WriteStateBackend::Remote(writer) => {
-                if args.offset != *len {
+                if args.offset != 0 && args.offset != *len {
                     return Err(Status::invalid_argument(
                         "write_at (random access/seeking) is restricted to local backends. Non-local backends must write sequentially.",
                     ));

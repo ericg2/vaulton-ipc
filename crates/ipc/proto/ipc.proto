@@ -11,6 +11,7 @@ message RepoSource {
 message PointSource {
   string scheme = 1;
   map<string, string> config = 2;
+  string root = 3;
 }
 
 message VfsPoint {
