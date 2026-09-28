@@ -192,7 +192,7 @@ impl StorageManager {
                 .with_backend(BackendOptions::default().with_repo(&config))
                 .with_credentials(Credentials::password(&src.password)),
         )
-        .map_err(|e| RusticError::with_source(ErrorKind::Vfs, "Failed to initialize VFS", e))?;
+            .map_err(|e| RusticError::with_source(ErrorKind::Vfs, "Failed to initialize VFS", e))?;
         Ok(op)
     }
 
@@ -230,7 +230,7 @@ impl StorageManager {
             if point.is_repo || !utils::is_local_scheme(&point.scheme) {
                 op = op.layer(QuotaLayer::new(
                     self.state.clone(),
-                    utils::quota_id(&user.username, &point.name),
+                    utils::quota_id(&user.username, &point.id),
                     max,
                 ));
             }
@@ -259,6 +259,14 @@ impl StorageManager {
                     refresh_interval: Some(Duration::from_mins(2)),
                 };
 
+                // 9-28-28: Ensure the repository exists and is loaded first.
+                let src = RepoSource {
+                    scheme: point.scheme.clone(),
+                    config: point.config.clone(),
+                    password: pass.clone(),
+                };
+
+                self.get_raw_repo(&src)?;
                 let op = Operator::from_config(scheme)?;
                 // Repo mounts are always read-only inside the VFS tree,
                 // independent of `point.read_only` — that flag instead gates
@@ -298,8 +306,8 @@ impl StorageSystem for StorageManager {
             this.repos.insert(src, repo.clone());
             Ok(repo)
         })
-        .await
-        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+            .await
+            .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
     }
 
     async fn get_repo_job(
@@ -315,8 +323,8 @@ impl StorageSystem for StorageManager {
             this.create_for_job(&src, operator.clone(), job_id, tx.clone(), false)
                 .or_else(|_| this.create_for_job(&src, operator, job_id, tx, true))
         })
-        .await
-        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+            .await
+            .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
     }
 
     async fn get_vfs(&self, user: &VfsUser) -> VfsResult<Operator> {
@@ -331,8 +339,8 @@ impl StorageSystem for StorageManager {
             this.vfs_ops.insert(user.clone(), op.clone());
             Ok(op)
         })
-        .await
-        .map_err(|e| VfsError::Internal(format!("spawn_blocking panicked: {e}")))?
+            .await
+            .map_err(|e| VfsError::Internal(format!("spawn_blocking panicked: {e}")))?
     }
 
     fn invalidate_vfs(&self, user: &VfsUser) {
@@ -370,6 +378,7 @@ mod tests {
 
     fn memory_point(name: &str, read_only: bool, max_bytes: Option<u64>) -> VfsPoint {
         VfsPoint {
+            id: Uuid::new_v4(),
             name: name.to_string(),
             max_bytes,
             read_only,

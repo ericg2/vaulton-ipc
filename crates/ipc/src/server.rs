@@ -6,7 +6,7 @@ use log::warn;
 use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
 use rustic_backend::local::LocalSource;
 use rustic_backend::opendal::OpenDALSource;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -156,6 +156,8 @@ impl TryFrom<ProtoVfsPoint> for VfsPoint {
         }
 
         Ok(VfsPoint {
+            id: Uuid::parse_str(&p.id)
+                .map_err(|_| Status::invalid_argument("Failed to parse UUID"))?,
             name: p.name,
             max_bytes: (p.max_bytes != 0).then_some(p.max_bytes),
             read_only: !p.can_write,
@@ -189,6 +191,7 @@ impl From<&VfsPoint> for ProtoVfsPoint {
         };
 
         ProtoVfsPoint {
+            id: point.id.to_string(),
             name: point.name.clone(),
             max_bytes: point.max_bytes.unwrap_or(0),
             can_write: !point.read_only,
@@ -253,21 +256,119 @@ impl From<SnapshotFile> for Snapshot {
     }
 }
 
-/// Renders only the *path* portion of a `FilePath` (the `user` is carried
-/// separately on the message and isn't part of the string).
-impl std::fmt::Display for FilePath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.path {
-            None => Ok(()),
-            Some(Path::Virtual(path)) => f.write_str(path),
-            Some(Path::Indexed(path)) => {
-                write!(
-                    f,
-                    "{}/{}",
-                    utils::data_mount_path(&path.point_name),
-                    path.point_path
-                )
+/// Validates stable point IDs and makes point names unique within each
+/// user's VFS namespace.
+///
+/// Point IDs are globally unique across the complete configuration. Names are
+/// only a presentation/mount concern, so a duplicate name is retained for the
+/// first point and later points receive a deterministic ID-based suffix.
+fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
+    let mut point_ids = HashSet::new();
+
+    for user in users.iter_mut() {
+        let mut names = HashSet::new();
+
+        for point in &mut user.points {
+            if point.id.is_nil() {
+                return Err(Status::invalid_argument(format!(
+                    "point '{}' for user '{}' has a nil ID",
+                    point.name, user.username
+                )));
             }
+
+            if !point_ids.insert(point.id) {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate VFS point ID '{}'",
+                    point.id
+                )));
+            }
+
+            if point.name.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "point '{}' for user '{}' has an empty name",
+                    point.id, user.username
+                )));
+            }
+
+            if point.name == "."
+                || point.name == ".."
+                || point.name.contains('/')
+                || point.name.contains('\\')
+            {
+                return Err(Status::invalid_argument(format!(
+                    "invalid VFS point name '{}'",
+                    point.name
+                )));
+            }
+
+            let original_name = point.name.clone();
+            if names.insert(original_name.clone()) {
+                continue;
+            }
+
+            let id_text = point.id.simple().to_string();
+            let mut assigned = None;
+
+            for prefix_len in [8usize, 12, 16, 20, 24, 32] {
+                let candidate = format!("{}-{}", original_name, &id_text[..prefix_len]);
+                if names.insert(candidate.clone()) {
+                    assigned = Some(candidate);
+                    break;
+                }
+            }
+
+            if assigned.is_none() {
+                let mut suffix = 2u64;
+                loop {
+                    let candidate = format!("{original_name}-{id_text}-{suffix}");
+                    if names.insert(candidate.clone()) {
+                        assigned = Some(candidate);
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
+
+            point.name = assigned.expect("name assignment always succeeds");
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolves a `FilePath` into the user's actual VFS mount path.
+///
+/// Indexed paths are ID-based so a point can be renamed without invalidating
+/// clients that already have its stable ID. The resulting VFS path still uses
+/// the point's current name because mount names are the user-facing namespace.
+fn resolve_file_path(user: &VfsUser, path: &FilePath) -> Result<String, Status> {
+    match &path.path {
+        None => Err(Status::invalid_argument("path is blank")),
+        Some(Path::Virtual(path)) => Ok(path.clone()),
+        Some(Path::Indexed(path)) => {
+            let point_id = Uuid::parse_str(&path.point_id)
+                .map_err(|_| Status::invalid_argument("malformed point_id"))?;
+
+            let point = user
+                .points
+                .iter()
+                .find(|point| point.id == point_id)
+                .ok_or_else(|| {
+                    Status::not_found(format!("point '{}' not found", path.point_id))
+                })?;
+
+            if point.is_repo {
+                return Err(Status::invalid_argument(format!(
+                    "point '{}' is a repo point; indexed paths only support data points",
+                    point.name
+                )));
+            }
+
+            Ok(format!(
+                "{}/{}",
+                utils::data_mount_path(&point.name),
+                path.point_path
+            ))
         }
     }
 }
@@ -282,14 +383,18 @@ fn entry_to_node(entry: &opendal_core::Entry) -> VfsNode {
         .next()
         .unwrap_or(entry.path())
         .to_string();
+
     let mtime = meta.last_modified().map(chrono_to_ts);
     VfsNode {
         name,
         is_dir: meta.is_dir(),
         bytes: meta.content_length(),
-        ctime: None,
+        ctime: mtime.clone(),
         mtime: mtime.clone(),
-        atime: None,
+        atime: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 0,
+        }),
     }
 }
 
@@ -365,8 +470,9 @@ where
         is_dir: bool,
     ) -> Result<(Operator, String), Status> {
         let user = self.get_user(&path.user).await?;
+        let vfs_path = resolve_file_path(&user, path)?;
         let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
-        Ok((op, fix_path(path.to_string(), is_dir)))
+        Ok((op, fix_path(vfs_path, is_dir)))
     }
 
     async fn get_user(&self, user: &str) -> Result<VfsUser, Status> {
@@ -440,12 +546,12 @@ where
     fn spawn_job<F>(&self, user: impl Into<String>, f: F) -> String
     where
         F: FnOnce(
-                Uuid,
-                chan::Sender<Data>,
-                CancelToken,
-            ) -> rustic_core::RusticResult<Option<String>>
-            + Send
-            + 'static,
+            Uuid,
+            chan::Sender<Data>,
+            CancelToken,
+        ) -> rustic_core::RusticResult<Option<String>>
+        + Send
+        + 'static,
     {
         let (job_id, token, tx) = self.register_job(user);
         let inner = Arc::clone(&self.inner);
@@ -494,32 +600,29 @@ where
 {
     async fn backup(&self, req: Request<BackupArgs>) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
-        let user = self.get_user(&args.user).await?;
 
-        // Backups write new snapshots into the repo, so reject up front if
-        // the repo point was marked read-only instead of letting the job
-        // fail once it's already running.
-        let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
+        let src = require_path(&args.src)?.clone();
+        let source_user = self.get_user(&src.user).await?;
+        let (data_point, source_path) = utils::resolve_data_file_path(&source_user, &src)?;
+
+        let repo_user = self.get_user(&args.repo_user).await?;
+        let repo_point = utils::require_repo_point_id(&repo_user, &args.repo_id)?;
         utils::require_writable(repo_point)?;
-
         let repo_src = utils::repo_source(repo_point)?;
-        let data_point = utils::require_data_point(&user, &args.data_name)?;
 
-        // Local/fs sources read straight off disk via `LocalSource`, bypassing
-        // the OpenDAL layer (and its quota tracking) entirely. Everything else
-        // still goes through `get_data_operator` as before.
         let local_path = if utils::is_local_scheme(&data_point.scheme) {
             Some(utils::local_source_path(data_point)?)
         } else {
             None
         };
+
         let source_op = if local_path.is_some() {
             None
         } else {
             Some(
                 self.inner
                     .storage
-                    .get_data_operator(&user, data_point)
+                    .get_data_operator(&source_user, data_point)
                     .map_err(map_vfs)?,
             )
         };
@@ -527,19 +630,19 @@ where
         let repo_op = self
             .inner
             .storage
-            .get_data_operator(&user, repo_point)
+            .get_data_operator(&repo_user, repo_point)
             .map_err(map_vfs)?;
 
         let tags = args.tags;
         let storage = Arc::clone(&self.inner.storage);
-        let username = user.username.clone();
+        let job_user = repo_user.username.clone();
 
-        let job_id = self.spawn_job(username, move |job_id, tx, token| {
+        let job_id = self.spawn_job(job_user, move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
             let tags = StringList::from_str(&tags.join(",")).unwrap();
             let snap = SnapshotOptions::default().tags(vec![tags]).to_snapshot()?;
             let repo = handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?;
-            let paths = PathList::from_string(&*args.source_path)?;
+            let paths = PathList::from_string(&source_path)?;
 
             let saved = if let Some(path) = local_path {
                 let source = LocalSource::new(path);
@@ -566,25 +669,26 @@ where
         req: Request<RestoreArgs>,
     ) -> Result<Response<JobStartResponse>, Status> {
         let args = req.into_inner();
-        let user = self.get_user(&args.user).await?;
 
-        let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
+        let dest = require_path(&args.dest)?.clone();
+        let dest_user = self.get_user(&dest.user).await?;
+        let (dest_point, dest_path) = utils::resolve_data_file_path(&dest_user, &dest)?;
+        utils::require_writable(dest_point)?;
+
+        let repo_user = self.get_user(&args.repo_user).await?;
+        let repo_point = utils::require_repo_point_id(&repo_user, &args.repo_id)?;
         let repo_src = utils::repo_source(repo_point)?;
 
-        // Restores write into the destination data point, so it must be
-        // writable — checked up front for the same reason as backup above.
-        let dest_point = utils::require_data_point(&user, &args.data_name)?;
-        utils::require_writable(dest_point)?;
         let dest_op = self
             .inner
             .storage
-            .get_data_operator(&user, dest_point)
+            .get_data_operator(&dest_user, dest_point)
             .map_err(map_vfs)?;
 
         let repo_op = self
             .inner
             .storage
-            .get_data_operator(&user, repo_point)
+            .get_data_operator(&repo_user, repo_point)
             .map_err(map_vfs)?;
 
         let snapshot_id = args.snapshot_id;
@@ -592,12 +696,13 @@ where
         let delete = args.delete;
         let dry_run = args.dry_run;
         let storage = Arc::clone(&self.inner.storage);
-        let username = user.username.clone();
+        let job_user = repo_user.username.clone();
 
-        let job_id = self.spawn_job(username, move |job_id, tx, token| {
+        let job_id = self.spawn_job(job_user, move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
-            let repo =
-                Arc::new(handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx))?);
+            let repo = Arc::new(handle.block_on(storage.get_repo_job(
+                &repo_src, repo_op, job_id, tx,
+            ))?);
             let dest = OpenDALSource::new(dest_op);
             let opts = RestoreOptions::default().delete(delete);
             let snap_path = format!("{}:{}", &snapshot_id, &snapshot_path);
@@ -608,7 +713,7 @@ where
                 &opts,
                 ls.clone(),
                 &dest,
-                &args.output_path,
+                &dest_path,
                 dry_run,
                 token.clone(),
             )?;
@@ -625,7 +730,7 @@ where
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
 
-        let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
+        let repo_point = utils::require_repo_point_id(&user, &args.repo_id)?;
         let repo_src = utils::repo_source(repo_point)?;
         let repo_op = self
             .inner
@@ -650,9 +755,7 @@ where
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
 
-        // Forget deletes snapshots from the repo, so it's write-bound like
-        // backup — reject up front if the repo point is read-only.
-        let repo_point = utils::require_repo_point(&user, &args.repo_name)?;
+        let repo_point = utils::require_repo_point_id(&user, &args.repo_id)?;
         utils::require_writable(repo_point)?;
         let repo_src = utils::repo_source(repo_point)?;
         let repo_op = self
@@ -690,11 +793,8 @@ where
     ) -> Result<Response<SnapshotResponse>, Status> {
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
+        let repo_src = utils::repo_source(utils::require_repo_point_id(&user, &args.repo_id)?)?;
 
-        let repo_src = utils::repo_source(utils::require_repo_point(&user, &args.repo_src)?)?;
-
-        // get_repo is async (spawn_blocking inside), so .await here is correct.
-        // get_all_snapshots is blocking, so it gets its own spawn_blocking.
         let repo = self
             .inner
             .storage
@@ -748,12 +848,14 @@ where
     }
 
     async fn set_vfs(&self, req: Request<SetVfsArgs>) -> Result<Response<Empty>, Status> {
-        let users = req
+        let mut users = req
             .into_inner()
             .users
             .into_iter()
             .map(VfsUser::try_from)
             .collect::<Result<Vec<_>, _>>()?;
+
+        normalize_vfs_users(&mut users)?;
 
         let old_users = self.inner.users.get_users().await.map_err(map_vfs)?;
         let mut changed_users = Vec::new();
@@ -767,29 +869,34 @@ where
                     if new_user != old_user {
                         changed_users.push(old_user.clone());
 
-                        // Find points that were removed from this user.
+                        // A point remains the same point when its stable ID
+                        // remains present, even if its display/mount name
+                        // changed.
                         for old_point in &old_user.points {
                             let still_exists = new_user
                                 .points
                                 .iter()
-                                .any(|point| point.name == old_point.name);
+                                .any(|point| point.id == old_point.id);
 
                             if !still_exists && !old_point.is_repo {
-                                removed_quotas
-                                    .push(utils::quota_id(&old_user.username, &old_point.name));
+                                removed_quotas.push(utils::quota_id(
+                                    &old_user.username,
+                                    &old_point.id,
+                                ));
                             }
                         }
                     }
                 }
 
                 None => {
-                    // The entire user was removed.
                     changed_users.push(old_user.clone());
 
-                    // Remove all quota state belonging to this user.
                     for point in &old_user.points {
                         if !point.is_repo {
-                            removed_quotas.push(utils::quota_id(&old_user.username, &point.name));
+                            removed_quotas.push(utils::quota_id(
+                                &old_user.username,
+                                &point.id,
+                            ));
                         }
                     }
                 }
@@ -800,9 +907,6 @@ where
         // invalidate caches, or remove quota state.
         self.inner.users.set_users(users).await.map_err(map_vfs)?;
 
-        // Cancel any in-flight job belonging to a user whose VFS config just
-        // changed (including removal, and read_only/max_bytes edits) before
-        // touching caches, so no job keeps running against stale points.
         let changed_usernames: HashSet<&str> =
             changed_users.iter().map(|u| u.username.as_str()).collect();
         for job in self.inner.jobs.iter() {
@@ -819,7 +923,6 @@ where
             self.inner.storage.invalidate_vfs(&user);
         }
 
-        // Remove quota state for points that were removed.
         for id in removed_quotas {
             self.inner
                 .quota
@@ -839,7 +942,7 @@ where
             for point in &user.points {
                 let used_bytes = if !point.is_repo && utils::is_local_scheme(&point.scheme) {
                     // Local points aren't tracked by the counter-based
-                    // `QuotaTracker` any more (see `store::point_operator`),
+                    // `QuotaTracker` anymore (see `store::point_operator`),
                     // so report their true on-disk footprint directly.
                     //
                     // A single misconfigured/unreadable local point (bad
@@ -880,7 +983,7 @@ where
                 } else {
                     self.inner
                         .quota
-                        .current_bytes(&utils::quota_id(&user.username, &point.name))
+                        .current_bytes(&utils::quota_id(&user.username, &point.id))
                         .await
                         .map_err(|err| Status::internal(err.to_string()))?
                 };
@@ -933,7 +1036,7 @@ where
         let args = request.into_inner();
         let file = require_path(&args.path)?;
         let user = self.get_user(&file.user).await?;
-        let path_str = file.to_string();
+        let path_str = resolve_file_path(&user, file)?;
 
         let (point, rest) = utils::resolve_data_path(&user, &path_str)?;
         utils::require_writable(point)?;

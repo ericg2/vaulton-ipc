@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::fmt::Formatter;
 use thiserror::Error;
 use unftp_core::auth::UserDetail;
-
+use uuid::Uuid;
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -63,6 +63,9 @@ pub type VfsResult<T> = Result<T, VfsError>;
 /// VFS) inside the user's composed [`Operator`].
 #[derive(Hash, Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct VfsPoint {
+    /// The ID of the point.
+    pub id: Uuid,
+
     /// Mount name — becomes the path component under the namespace prefix.
     pub name: String,
 

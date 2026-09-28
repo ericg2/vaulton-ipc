@@ -257,12 +257,14 @@ impl TryFrom<UserRow> for VfsUser {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use uuid::Uuid;
 
     fn dummy_user(name: &str) -> VfsUser {
         VfsUser {
             username: name.to_string(),
             password: "password".to_string(),
             points: vec![VfsPoint {
+                id: Uuid::new_v4(),
                 name: "primary".to_string(),
                 max_bytes: Some(1_073_741_824),
                 read_only: false,

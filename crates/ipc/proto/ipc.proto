@@ -15,12 +15,13 @@ message PointSource {
 }
 
 message VfsPoint {
-  string name = 1;
-  uint64 max_bytes = 2;
-  bool can_write = 3;
+  string id = 1;
+  string name = 2;
+  uint64 max_bytes = 3;
+  bool can_write = 4;
   oneof src {
-    PointSource data = 4;
-    RepoSource repo = 5;
+    PointSource data = 5;
+    RepoSource repo = 6;
   }
 }
 
@@ -45,7 +46,7 @@ message FilePath {
 }
 
 message IndexedPath {
-  string point_name = 1;
+  string point_id = 1;
   string point_path = 2;
 }
 
@@ -108,36 +109,34 @@ message Snapshot {
 // Example: backup "/points/local/test/abcd" (a VFS path under one of the
 // user's mounted data points) to the repo point named "repo_name".
 message BackupArgs {
-  string user = 1;
-  string data_name = 2;
-  string source_path = 3;
-  string repo_name = 4;
+  FilePath src = 1;
+  string repo_user = 2;
+  string repo_id = 3;
+  bool dry_run = 4;
   optional DataFilter filter = 5;
   repeated string tags = 6;
-  bool dry_run = 7;
 }
 
 // Example: restore "/" from repo point "repo_name", snapshot "xyz", to VFS
 // path "/points/local/test/abcdefg" (a mounted data point).
 message RestoreArgs {
-  string user = 1;
-  string repo_name = 2;
+  string repo_user = 1;
+  string repo_id = 2;
   string snapshot_id = 3;
   string snapshot_path = 4;
-  string data_name = 5;
-  string output_path = 6; // the destination VFS data path
-  bool delete = 7;
-  bool dry_run = 8;
+  FilePath dest = 5;
+  bool delete = 6;
+  bool dry_run = 7;
 }
 
 message CheckArgs {
   string user = 1;
-  string repo_name = 2;
+  string repo_id = 2;
 }
 
 message ForgetArgs {
   string user = 1;
-  string repo_name = 2;
+  string repo_id = 2;
   repeated string snapshots = 3;
 }
 
@@ -147,7 +146,7 @@ message CancelArgs {
 
 message GetSnapshotArgs {
   string user = 1;
-  string repo_src = 2;
+  string repo_id = 2;
 }
 
 ///////////////////////////////////////////////////////////////////
