@@ -36,10 +36,11 @@ message VfsUser {
   repeated VfsPoint points = 3;
 }
 
-message VfsPath {
+message FilePath {
+  string user = 1;
   oneof path {
-    string virtual = 1;
-    IndexedPath indexed = 2;
+    string virtual = 2;
+    IndexedPath indexed = 3;
   }
 }
 
@@ -233,10 +234,9 @@ message ListVfsResponse {
 }
 
 message ReadVfsArgs {
-  string user = 1;
-  VfsPath path = 2;
-  uint64 offset = 3;
-  uint64 length = 4;
+  FilePath path = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
 }
 
 message ReadVfsResponse {
@@ -246,16 +246,10 @@ message ReadVfsResponse {
 // Opens a write handle on `path`. Supported for all backends.
 // For local/fs-backed points, this allows random-access via Vfs_WriteAt.
 // For non-local points, writes via Vfs_WriteAt must be sequential (like a stream).
-//
-// Opening always starts the file from empty (equivalent to O_TRUNC): any
-// existing content at `path` is discarded immediately, not on first write.
-// Use Vfs_WriteAt to fill it in, then Vfs_CloseWrite to finish and release
-// the handle. A handle that's never closed will hang around for the
-// lifetime of the server process, so callers (e.g. an SMB layer) should
-// always close on every code path, including errors/aborted transfers.
 message OpenWriteArgs {
-  string user = 1;
-  VfsPath path = 2;
+  FilePath path = 1;
+  bool overwrite = 2;
+  bool append = 3;
 }
 
 message OpenWriteResponse {
@@ -283,17 +277,10 @@ message CloseHandleArgs {
   string handle_id = 1;
 }
 
-message FilePath {
-  string user = 1;
-  VfsPath path = 2;
-}
-
 message TransferArgs {
-  string old_user = 1;
-  VfsPath old_path = 2;
-  string new_user = 3;
-  VfsPath new_path = 4;
-  bool copy = 5;
+  FilePath old_path = 1;
+  FilePath new_path = 2;
+  bool copy = 3;
 }
 
 message StatResponse {
@@ -340,6 +327,5 @@ service IpcService {
   rpc Vfs_Stat(FilePath) returns (StatResponse);
   rpc Vfs_Exists(FilePath) returns (ExistsResponse);
 
-  rpc Vfs_Transfer(TransferArgs) returns (Empty);
-
+  rpc Vfs_Transfer(TransferArgs) returns (JobStartResponse);
 }

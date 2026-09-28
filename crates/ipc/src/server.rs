@@ -17,9 +17,9 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::core::{UserSystem, VfsPoint, VfsUser};
+use crate::ipc::file_path::Path;
 use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
 use crate::ipc::job_event::Data;
-use crate::ipc::vfs_path::Path;
 use crate::ipc::vfs_point::Src as ProtoSrc;
 use crate::ipc::{
     BackupArgs, CancelArgs, CheckArgs, CloseHandleArgs, Empty, ExistsResponse, FilePath,
@@ -27,9 +27,10 @@ use crate::ipc::{
     JobNewMessageEvent, JobStartResponse, ListVfsResponse, OpenWriteArgs, OpenWriteResponse,
     PointSource as ProtoPoint, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse,
     RepoSource as ProtoRepo, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse,
-    Summary, TransferArgs, VfsNode, VfsPath, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser,
+    Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser,
     WriteAtArgs,
 };
+use crate::progress::RusticProgressBars;
 use crate::store::StorageSystem;
 use crate::utils;
 use crate::utils::{fix_path, map_dal, map_vfs};
@@ -37,7 +38,8 @@ use opendal_vfs::layers::quota::{QuotaState, QuotaTracker};
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
 use rustic_core::{
-    CancelToken, CheckOptions, LsOptions, PathList, RestoreOptions, SnapshotOptions, StringList,
+    CancelToken, CheckOptions, LsOptions, PathList, ProgressBars, ProgressType, RestoreOptions,
+    SnapshotOptions, StringList,
 };
 
 // ── Unified Write handles ──────────────────────────────────────────────
@@ -58,6 +60,23 @@ struct ActiveWriteHandle {
     state: TokioMutex<WriteState>,
     max_bytes: Option<u64>,
     baseline_bytes: u64,
+    /// When true, every `Vfs_WriteAt` on this handle ignores the caller's
+    /// `offset` and instead writes at the current end of the file/stream.
+    ///
+    /// Always `true` for non-local (remote) backends: `Vfs_OpenWrite`
+    /// always creates a brand-new remote writer for the handle (there's no
+    /// "open an existing remote object for random-access editing"
+    /// primitive), so writes are inherently sequential regardless of
+    /// whether the backend advertises native append support — we're simply
+    /// streaming bytes into a fresh object in call order, not resuming an
+    /// existing one. `Vfs_OpenWrite` rejects `append == false` for remote
+    /// destinations rather than silently ignoring `offset`.
+    ///
+    /// For local backends this mirrors whatever the caller requested, and
+    /// combines with `overwrite` (truncate-on-open) the normal way: e.g.
+    /// `overwrite=true, append=true` truncates on open and then appends
+    /// everything written in this session from byte 0.
+    append: bool,
 }
 
 /// Maps an I/O error to the closest matching gRPC status, the same way
@@ -72,6 +91,13 @@ fn io_status(e: std::io::Error) -> Status {
 
 fn parse_handle_id(id: &str) -> Result<Uuid, Status> {
     Uuid::parse_str(id).map_err(|_| Status::invalid_argument("malformed handle_id"))
+}
+
+/// Unwraps an optional `FilePath` message field, returning
+/// `INVALID_ARGUMENT` if the caller left it unset.
+fn require_path(path: &Option<FilePath>) -> Result<&FilePath, Status> {
+    path.as_ref()
+        .ok_or_else(|| Status::invalid_argument("path is blank"))
 }
 
 /// Checks that growing a local point's on-disk footprint by `growth` bytes
@@ -146,7 +172,11 @@ impl From<&VfsPoint> for ProtoVfsPoint {
         let p = ProtoPoint {
             scheme: point.scheme.clone(),
             config: point.config.clone().into_iter().collect(),
-            root: point.config.get("root").unwrap_or(&String::new()).to_string(),
+            root: point
+                .config
+                .get("root")
+                .unwrap_or(&String::new())
+                .to_string(),
         };
 
         let src = if point.is_repo {
@@ -223,7 +253,9 @@ impl From<SnapshotFile> for Snapshot {
     }
 }
 
-impl std::fmt::Display for VfsPath {
+/// Renders only the *path* portion of a `FilePath` (the `user` is carried
+/// separately on the message and isn't part of the string).
+impl std::fmt::Display for FilePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.path {
             None => Ok(()),
@@ -325,23 +357,78 @@ where
         }
     }
 
-    /// Attempts to resolve the [`Operator`] and path.
+    /// Attempts to resolve the [`Operator`] and normalized path string for a
+    /// [`FilePath`]. The owning user is taken from `path.user`.
     async fn get_operator(
         &self,
-        user: &str,
-        path: &Option<VfsPath>,
+        path: &FilePath,
         is_dir: bool,
     ) -> Result<(Operator, String), Status> {
-        let user = self.get_user(user).await?;
+        let user = self.get_user(&path.user).await?;
         let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
-        let path = path
-            .as_ref()
-            .ok_or(Status::invalid_argument("path is blank"))?;
         Ok((op, fix_path(path.to_string(), is_dir)))
     }
 
     async fn get_user(&self, user: &str) -> Result<VfsUser, Status> {
-        self.inner.users.get_user(&user).await.map_err(map_vfs)
+        self.inner.users.get_user(user).await.map_err(map_vfs)
+    }
+
+    /// Registers a new job (cancel token + owning `user`) and starts the
+    /// bridge thread that drains its `crossbeam` progress/event channel
+    /// into the async-safe `events` buffer. Shared setup for `spawn_job`
+    /// and `spawn_async_job` — everything past this point differs only in
+    /// how the job body actually runs (blocking-thread rustic calls vs. a
+    /// plain tokio future).
+    fn register_job(&self, user: impl Into<String>) -> (Uuid, CancelToken, chan::Sender<Data>) {
+        let job_id = Uuid::new_v4();
+        let token = CancelToken::new();
+        let (tx, rx) = chan::unbounded::<Data>();
+        self.inner.jobs.insert(
+            job_id,
+            JobHandle {
+                token: token.clone(),
+                user: user.into(),
+            },
+        );
+
+        let inner = Arc::clone(&self.inner);
+        std::thread::spawn(move || {
+            while let Ok(data) = rx.recv() {
+                if let Ok(mut buf) = inner.events.lock() {
+                    buf.push_back(JobEvent { data: Some(data) });
+                }
+            }
+        });
+
+        (job_id, token, tx)
+    }
+
+    /// Sends the terminal `JobMessage` (on error) and `JobFinished` events
+    /// for a job and removes it from the active-jobs map. Shared tail end
+    /// of `spawn_job` and `spawn_async_job`.
+    fn finish_job(
+        inner: &Arc<Inner<S, U>>,
+        job_id: Uuid,
+        tx: chan::Sender<Data>,
+        result: Result<Option<String>, String>,
+    ) {
+        if let Err(ref e) = result {
+            let _ = tx.send(Data::JobMessage(JobNewMessageEvent {
+                job_id: job_id.to_string(),
+                priority: Priority::Error as i32,
+                message: e.clone(),
+                time: Some(utils::to_ts(Zoned::now())),
+            }));
+        }
+
+        let _ = tx.send(Data::JobFinished(JobFinishedEvent {
+            job_id: job_id.to_string(),
+            success: result.is_ok(),
+            snapshot: result.ok().flatten(),
+            time: Some(utils::to_ts(Zoned::now())),
+        }));
+
+        inner.jobs.remove(&job_id);
     }
 
     /// Spawn a background job owned by `user` and return its ID immediately.
@@ -360,52 +447,38 @@ where
             + Send
             + 'static,
     {
-        let job_id = Uuid::new_v4();
-        let token = CancelToken::new();
-        let (tx, rx) = chan::unbounded::<Data>();
-        self.inner.jobs.insert(
-            job_id,
-            JobHandle {
-                token: token.clone(),
-                user: user.into(),
-            },
-        );
-        {
-            // Bridge thread — drains crossbeam channel into the async-safe
-            // event buffer using std::Mutex, never touching the tokio runtime.
-            let inner = Arc::clone(&self.inner);
-            std::thread::spawn(move || {
-                while let Ok(data) = rx.recv() {
-                    if let Ok(mut buf) = inner.events.lock() {
-                        buf.push_back(JobEvent { data: Some(data) });
-                    }
-                }
-            });
-        }
-        {
-            let inner = Arc::clone(&self.inner);
-            tokio::task::spawn_blocking(move || {
-                let result = f(job_id, tx.clone(), token);
+        let (job_id, token, tx) = self.register_job(user);
+        let inner = Arc::clone(&self.inner);
 
-                if let Err(ref e) = result {
-                    let _ = tx.send(Data::JobMessage(JobNewMessageEvent {
-                        job_id: job_id.to_string(),
-                        priority: Priority::Error as i32,
-                        message: e.to_string(),
-                        time: Some(utils::to_ts(Zoned::now())),
-                    }));
-                }
+        tokio::task::spawn_blocking(move || {
+            let result = f(job_id, tx.clone(), token).map_err(|e| e.to_string());
+            Self::finish_job(&inner, job_id, tx, result);
+        });
 
-                let _ = tx.send(Data::JobFinished(JobFinishedEvent {
-                    job_id: job_id.to_string(),
-                    success: result.is_ok(),
-                    snapshot: result.ok().flatten(),
-                    time: Some(utils::to_ts(Zoned::now())),
-                }));
+        job_id.to_string()
+    }
 
-                inner.jobs.remove(&job_id);
-            });
-        }
+    /// Like [`spawn_job`](Self::spawn_job), but for jobs that are plain
+    /// `async` tokio work rather than blocking rustic calls — e.g.
+    /// `Vfs_Transfer`'s OpenDAL copy/streaming. Runs `f` as a future on the
+    /// tokio runtime instead of inside `spawn_blocking`, and is generic
+    /// over any displayable error type so callers don't have to funnel
+    /// non-rustic errors through `RusticError` just to reuse this plumbing.
+    fn spawn_async_job<F, Fut, E>(&self, user: impl Into<String>, f: F) -> String
+    where
+        F: FnOnce(Uuid, chan::Sender<Data>, CancelToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Option<String>, E>> + Send + 'static,
+        E: std::fmt::Display,
+    {
+        let (job_id, token, tx) = self.register_job(user);
+        let inner = Arc::clone(&self.inner);
+
+        tokio::spawn(async move {
+            let result = f(job_id, tx.clone(), token)
+                .await
+                .map_err(|e| e.to_string());
+            Self::finish_job(&inner, job_id, tx, result);
+        });
 
         job_id.to_string()
     }
@@ -828,7 +901,8 @@ where
         request: Request<ReadVfsArgs>,
     ) -> Result<Response<ReadVfsResponse>, Status> {
         let args = request.into_inner();
-        let (op, path) = self.get_operator(&args.user, &args.path, false).await?;
+        let file = require_path(&args.path)?;
+        let (op, path) = self.get_operator(file, false).await?;
         let buf = if args.length == 0 {
             op.read(&path).await.map_err(map_dal)?
         } else {
@@ -845,17 +919,21 @@ where
 
     // ── Write handles (streaming + random access) ─────────────────
 
+    async fn vfs_touch_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+        let (op, path) = self.get_operator(&args, false).await?;
+        op.write(&path, Buffer::new()).await.map_err(map_dal)?;
+        Ok(Response::new(Empty {}))
+    }
+
     async fn vfs_open_write(
         &self,
         request: Request<OpenWriteArgs>,
     ) -> Result<Response<OpenWriteResponse>, Status> {
         let args = request.into_inner();
-        let user = self.get_user(&args.user).await?;
-        let path_str = args
-            .path
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("path is blank"))?
-            .to_string();
+        let file = require_path(&args.path)?;
+        let user = self.get_user(&file.user).await?;
+        let path_str = file.to_string();
 
         let (point, rest) = utils::resolve_data_path(&user, &path_str)?;
         utils::require_writable(point)?;
@@ -874,7 +952,7 @@ where
                 .create(true)
                 .write(true)
                 .read(true)
-                .truncate(true)
+                .truncate(args.overwrite)
                 .open(&full_path)
                 .await
                 .map_err(io_status)?;
@@ -904,10 +982,26 @@ where
                     }),
                     max_bytes: point.max_bytes,
                     baseline_bytes,
+                    append: args.append,
                 },
             );
         } else {
-            let (op, file_path) = self.get_operator(&args.user, &args.path, false).await?;
+            // Remote destinations: `Vfs_OpenWrite` always opens a brand-new
+            // writer (opendal has no "open an existing object for
+            // random-access editing" primitive), so `Vfs_WriteAt` on this
+            // handle is inherently sequential regardless of the backend's
+            // native append capability — we're streaming into a fresh
+            // object, not resuming one. Require the caller to acknowledge
+            // this by setting `append = true` rather than silently ignoring
+            // `offset` later; `overwrite` is implied by opening a fresh
+            // writer and doesn't need separate handling here.
+            if !args.append {
+                return Err(Status::invalid_argument(
+                    "non-local write destinations only support sequential (append) writes; set append=true",
+                ));
+            }
+
+            let (op, file_path) = self.get_operator(file, false).await?;
             let writer = op.writer(&file_path).await.map_err(map_dal)?;
 
             self.inner.write_handles.insert(
@@ -919,6 +1013,7 @@ where
                     }),
                     max_bytes: None, // Remote quotas are handled downstream via OpenDAL quota layer
                     baseline_bytes: 0,
+                    append: true,
                 },
             );
         }
@@ -944,7 +1039,15 @@ where
 
         match backend {
             WriteStateBackend::Local(file) => {
-                let new_len = (*len).max(args.offset + args.data.len() as u64);
+                // In append mode the caller's offset is ignored entirely —
+                // always write at the current end of the file.
+                let write_offset = if handle.append {
+                    file.seek(SeekFrom::End(0)).await.map_err(io_status)?
+                } else {
+                    args.offset
+                };
+
+                let new_len = (*len).max(write_offset + args.data.len() as u64);
 
                 if let Some(max) = handle.max_bytes {
                     if handle.baseline_bytes + new_len > max {
@@ -955,9 +1058,11 @@ where
                     }
                 }
 
-                file.seek(SeekFrom::Start(args.offset))
-                    .await
-                    .map_err(io_status)?;
+                if !handle.append {
+                    file.seek(SeekFrom::Start(write_offset))
+                        .await
+                        .map_err(io_status)?;
+                }
 
                 file.write_all(&args.data).await.map_err(io_status)?;
 
@@ -965,12 +1070,9 @@ where
             }
 
             WriteStateBackend::Remote(writer) => {
-                if args.offset != 0 && args.offset != *len {
-                    return Err(Status::invalid_argument(
-                        "write_at (random access/seeking) is restricted to local backends. Non-local backends must write sequentially.",
-                    ));
-                }
-
+                // Always append mode here (enforced in `Vfs_OpenWrite`), so
+                // `offset` is ignored and writes are purely sequential into
+                // the fresh writer opened for this handle.
                 writer.write(args.data.clone()).await.map_err(map_dal)?;
 
                 *len += args.data.len() as u64;
@@ -1008,19 +1110,12 @@ where
         Ok(Response::new(Empty {}))
     }
 
-    async fn vfs_touch_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
-        let args = request.into_inner();
-        let (op, path) = self.get_operator(&args.user, &args.path, false).await?;
-        op.write(&path, Buffer::new()).await.map_err(map_dal)?;
-        Ok(Response::new(Empty {}))
-    }
-
     async fn vfs_list_dir(
         &self,
         request: Request<FilePath>,
     ) -> Result<Response<ListVfsResponse>, Status> {
         let args = request.into_inner();
-        let (op, path) = self.get_operator(&args.user, &args.path, true).await?;
+        let (op, path) = self.get_operator(&args, true).await?;
         let entries = op.list_with(&path).await.map_err(map_dal)?;
 
         Ok(Response::new(ListVfsResponse {
@@ -1030,21 +1125,21 @@ where
 
     async fn vfs_create_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
-        let (op, path) = self.get_operator(&args.user, &args.path, true).await?;
+        let (op, path) = self.get_operator(&args, true).await?;
         op.create_dir(&path).await.map_err(map_dal)?;
         Ok(Response::new(Empty {}))
     }
 
     async fn vfs_remove_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
-        let (op, path) = self.get_operator(&args.user, &args.path, false).await?;
+        let (op, path) = self.get_operator(&args, false).await?;
         op.delete_with(&path).await.map_err(map_dal)?;
         Ok(Response::new(Empty {}))
     }
 
     async fn vfs_remove_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
-        let (op, path) = self.get_operator(&args.user, &args.path, true).await?;
+        let (op, path) = self.get_operator(&args, true).await?;
         op.delete_with(&path)
             .recursive(true)
             .await
@@ -1059,7 +1154,7 @@ where
         // and `fix_path` normalizes each differently (trailing slash for
         // dirs). Try the file form first since that's the common case, and
         // fall back to the directory form on NotFound before giving up.
-        let (op, file_path) = self.get_operator(&args.user, &args.path, false).await?;
+        let (op, file_path) = self.get_operator(&args, false).await?;
 
         let meta = match op.stat(&file_path).await {
             Ok(meta) => meta,
@@ -1099,7 +1194,7 @@ where
 
         // Same file-then-dir probing strategy as `vfs_stat`, since we don't
         // know the path kind up front.
-        let (op, file_path) = self.get_operator(&args.user, &args.path, false).await?;
+        let (op, file_path) = self.get_operator(&args, false).await?;
 
         let exists = match op.stat(&file_path).await {
             Ok(_) => true,
@@ -1117,18 +1212,27 @@ where
         Ok(Response::new(ExistsResponse { exists }))
     }
 
+    /// Transfers (copies or moves) a single file between two VFS paths as a
+    /// background job, so callers get progress and can poll/cancel it the
+    /// same way they do for `Backup`/`Restore`.
+    ///
+    /// Same-backend transfers use opendal's native `copy`/`rename` and
+    /// report a single before/after tick — there's no meaningful partial
+    /// progress for an atomic backend-side operation. Cross-backend
+    /// transfers stream the file in chunks and report real byte progress
+    /// per chunk, which also keeps a cancellation request from having to
+    /// wait for the whole file to move first.
     async fn vfs_transfer(
         &self,
         request: Request<TransferArgs>,
-    ) -> Result<Response<Empty>, Status> {
+    ) -> Result<Response<JobStartResponse>, Status> {
         let args = request.into_inner();
 
-        let (src_op, src_path) = self
-            .get_operator(&args.old_user, &args.old_path, false)
-            .await?;
-        let (dst_op, dst_path) = self
-            .get_operator(&args.new_user, &args.new_path, false)
-            .await?;
+        let old_file = require_path(&args.old_path)?;
+        let new_file = require_path(&args.new_path)?;
+
+        let (src_op, src_path) = self.get_operator(old_file, false).await?;
+        let (dst_op, dst_path) = self.get_operator(new_file, false).await?;
 
         // Two operators are "the same backend" if their scheme, root, and
         // backend name all match. This is the closest thing OpenDAL exposes
@@ -1139,47 +1243,110 @@ where
             && src_info.root() == dst_info.root()
             && src_info.name() == dst_info.name();
 
+        let copy = args.copy;
+        let username = old_file.user.clone();
+
         if same_backend {
             // Same backend: let opendal do an intra-backend copy/rename,
             // which is typically far cheaper than a read+write round trip
-            // (and atomic where the backend supports it).
-            if args.copy {
-                src_op.copy(&src_path, &dst_path).await.map_err(map_dal)?;
-            } else {
-                src_op.rename(&src_path, &dst_path).await.map_err(map_dal)?;
-            }
-        } else {
-            // Different backends: no cross-backend copy/rename primitive
-            // exists, so stream the bytes through manually. This only
-            // handles single files, not recursive directory trees.
-            let buf = src_op.read(&src_path).await.map_err(map_dal)?;
+            // (and atomic where the backend supports it). Nothing here can
+            // report partial progress, so the bar just brackets the call.
+            let job_id = self.spawn_async_job::<_, _, String>(
+                username,
+                move |job_id, tx, _token| async move {
+                    let bars = RusticProgressBars::new(job_id, tx);
+                    let bar = bars.progress(ProgressType::Bytes, "transfer");
+                    bar.set_length(1);
 
-            // If the destination is a local point with a quota, check real
-            // on-disk usage before writing — this write goes through the
-            // OpenDAL operator like any other non-handle write, so it isn't
-            // covered by `Vfs_OpenWrite`/`Vfs_WriteAt`'s per-write checks.
-            if let Ok(dst_user) = self.get_user(&args.new_user).await {
-                if let Ok((dst_point, dst_rest)) = utils::resolve_data_path(&dst_user, &dst_path) {
-                    if utils::is_local_scheme(&dst_point.scheme) {
-                        let root = PathBuf::from(utils::local_source_path(dst_point)?);
-                        let full_path = root.join(&dst_rest);
-                        let existing_len = tokio::fs::metadata(&full_path)
+                    if copy {
+                        src_op
+                            .copy(&src_path, &dst_path)
                             .await
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        let growth = (buf.len() as u64).saturating_sub(existing_len);
-                        check_local_quota(&root, dst_point.max_bytes, growth).await?;
+                            .map_err(|e| e.to_string())?;
+                    } else {
+                        src_op
+                            .rename(&src_path, &dst_path)
+                            .await
+                            .map_err(|e| e.to_string())?;
                     }
+
+                    bar.inc(1);
+                    bar.finish();
+                    Ok(None)
+                },
+            );
+
+            return Ok(Response::new(JobStartResponse { job_id }));
+        }
+
+        // Different backends: no cross-backend copy/rename primitive
+        // exists, so stream the bytes through manually, in chunks so
+        // progress and cancellation are meaningful mid-transfer.
+        //
+        // `stat` and the quota check both happen up front, before the job
+        // is even spawned — same as the read-only checks `backup`/`restore`
+        // do — so a doomed transfer is rejected immediately instead of
+        // being accepted and failing once it's already running.
+        let meta = src_op.stat(&src_path).await.map_err(map_dal)?;
+        let total = meta.content_length();
+
+        if let Ok(dst_user) = self.get_user(&new_file.user).await {
+            if let Ok((dst_point, dst_rest)) = utils::resolve_data_path(&dst_user, &dst_path) {
+                if utils::is_local_scheme(&dst_point.scheme) {
+                    let root = PathBuf::from(utils::local_source_path(dst_point)?);
+                    let full_path = root.join(&dst_rest);
+                    let existing_len = tokio::fs::metadata(&full_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    let growth = total.saturating_sub(existing_len);
+                    check_local_quota(&root, dst_point.max_bytes, growth).await?;
                 }
-            }
-
-            dst_op.write(&dst_path, buf).await.map_err(map_dal)?;
-
-            if !args.copy {
-                src_op.delete(&src_path).await.map_err(map_dal)?;
             }
         }
 
-        Ok(Response::new(Empty {}))
+        let job_id = self.spawn_async_job(username, move |job_id, tx, token| async move {
+            let bars = RusticProgressBars::new(job_id, tx);
+            let bar = bars.progress(ProgressType::Bytes, "transfer");
+            bar.set_length(total.max(1));
+
+            // 8 MiB chunks: big enough to keep per-chunk overhead low,
+            // small enough that progress updates stay meaningfully
+            // granular and a cancellation is noticed promptly rather than
+            // only between whole-file reads.
+            const CHUNK: u64 = 8 * 1024 * 1024;
+
+            let mut writer = dst_op.writer(&dst_path).await.map_err(|e| e.to_string())?;
+            let mut offset = 0u64;
+
+            while offset < total {
+                if token.is_cancelled() {
+                    return Err("transfer cancelled".to_string());
+                }
+
+                let end = (offset + CHUNK).min(total);
+                let buf = src_op
+                    .read_with(&src_path)
+                    .range(offset..end)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let n = buf.len() as u64;
+
+                writer.write(buf).await.map_err(|e| e.to_string())?;
+                bar.inc(n);
+                offset = end;
+            }
+
+            writer.close().await.map_err(|e| e.to_string())?;
+
+            if !copy {
+                src_op.delete(&src_path).await.map_err(|e| e.to_string())?;
+            }
+
+            bar.finish();
+            Ok(None)
+        });
+
+        Ok(Response::new(JobStartResponse { job_id }))
     }
 }
