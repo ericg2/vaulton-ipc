@@ -1,9 +1,14 @@
 use crate::db::DbManager;
+use crate::ipc::LogEvent;
+use crate::ipc::ipc_event::Data;
 use crate::ipc::ipc_service_server::IpcServiceServer;
 use crate::server::GrpcServer;
 use crate::store::StorageManager;
-use log::LevelFilter;
+use crate::utils::fix_level;
+use crossbeam_channel::Sender;
+use log::{LevelFilter, Log, Metadata, Record};
 use prost_types::Timestamp;
+use rustic_core::jiff::Zoned;
 use simplelog::{Config, SimpleLogger};
 use std::error::Error;
 use std::sync::Arc;
@@ -31,12 +36,46 @@ pub(crate) fn proto_stamp(ts: rustic_core::jiff::Timestamp) -> Option<Timestamp>
 
 const TTL: Duration = Duration::from_mins(3);
 
+struct ChannelLogger {
+    logger: Box<SimpleLogger>,
+    tx: Sender<Data>,
+}
+
+impl Log for ChannelLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        self.logger.enabled(metadata)
+    }
+
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        self.logger.log(record);
+        let _ = self.tx.send(Data::LogEvent(LogEvent {
+            priority: fix_level(record.level()),
+            message: record.args().to_string(),
+            time: proto_stamp(rustic_core::jiff::Timestamp::now()),
+        }));
+    }
+
+    fn flush(&self) {
+        self.logger.flush();
+    }
+}
+
 #[tokio::main]
 async fn main() {
     use rustic_core::*;
 
-    let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    let logger = ChannelLogger {
+        logger: SimpleLogger::new(LevelFilter::Debug, Config::default()),
+        tx: log_tx,
+    };
 
+    log::set_boxed_logger(Box::new(logger)).unwrap();
+    log::set_max_level(LevelFilter::Debug);
+    
     let db = Arc::new(DbManager::open("poop.sqlite").await.unwrap());
     let store = Arc::new(StorageManager::new(db.clone(), TTL));
     let serv = GrpcServer::new(store.clone(), db.clone(), store.state.clone());

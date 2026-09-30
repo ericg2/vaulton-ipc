@@ -1,10 +1,10 @@
-use crate::ipc::job_event::Data;
 use crate::ipc::{JobBarFinished, JobBarIncrement, JobBarLengthSet, JobBarTitleSet};
 use crate::proto_stamp;
 use crossbeam_channel::Sender;
 use rustic_core::jiff::Timestamp;
 use rustic_core::{Progress, ProgressBars, ProgressType, RusticProgress};
 use uuid::Uuid;
+use crate::ipc::ipc_event::Data;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RepoBar {

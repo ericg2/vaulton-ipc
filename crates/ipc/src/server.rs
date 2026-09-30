@@ -19,17 +19,8 @@ use uuid::Uuid;
 use crate::core::{UserSystem, VfsPoint, VfsUser};
 use crate::ipc::file_path::Path;
 use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
-use crate::ipc::job_event::Data;
 use crate::ipc::vfs_point::Src as ProtoSrc;
-use crate::ipc::{
-    BackupArgs, CancelArgs, CheckArgs, CloseHandleArgs, Empty, ExistsResponse, FilePath,
-    ForgetArgs, GetSnapshotArgs, InfoResponse, JobCancelResponse, JobEvent, JobFinishedEvent,
-    JobNewMessageEvent, JobStartResponse, ListVfsResponse, OpenWriteArgs, OpenWriteResponse,
-    PointSource as ProtoPoint, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse,
-    RepoSource as ProtoRepo, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse,
-    Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser,
-    WriteAtArgs,
-};
+use crate::ipc::{BackupArgs, CancelArgs, CheckArgs, CloseHandleArgs, Empty, ExistsResponse, FilePath, ForgetArgs, GetSnapshotArgs, InfoResponse, IpcEvent, JobCancelResponse, JobFinishedEvent, JobNewMessageEvent, JobStartResponse, ListVfsResponse, OpenWriteArgs, OpenWriteResponse, PointSource as ProtoPoint, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse, RepoSource as ProtoRepo, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteAtArgs};
 use crate::progress::RusticProgressBars;
 use crate::store::StorageSystem;
 use crate::utils;
@@ -41,6 +32,7 @@ use rustic_core::{
     CancelToken, CheckOptions, LsOptions, PathList, ProgressBars, ProgressType, RestoreOptions,
     SnapshotOptions, StringList,
 };
+use crate::ipc::ipc_event::Data;
 
 // ── Unified Write handles ──────────────────────────────────────────────
 //
@@ -427,7 +419,7 @@ where
     users: Arc<U>,
     quota: QuotaState,
     jobs: DashMap<Uuid, JobHandle>,
-    events: StdMutex<VecDeque<JobEvent>>,
+    events: StdMutex<VecDeque<IpcEvent>>,
     /// Open `Vfs_OpenWrite` handles, keyed by the id handed back to the
     /// caller. Entries live here for the lifetime of the handle and are
     /// removed by `Vfs_CloseWrite`.
@@ -501,7 +493,7 @@ where
         std::thread::spawn(move || {
             while let Ok(data) = rx.recv() {
                 if let Ok(mut buf) = inner.events.lock() {
-                    buf.push_back(JobEvent { data: Some(data) });
+                    buf.push_back(IpcEvent { data: Some(data) });
                 }
             }
         });

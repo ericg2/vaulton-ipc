@@ -3,7 +3,6 @@
 
 use crate::core::{VfsError, VfsPoint, VfsResult, VfsUser};
 use crate::db::DbManager;
-use crate::ipc::job_event::Data;
 use crate::progress::RusticProgressBars;
 use crate::utils;
 use async_trait::async_trait;
@@ -26,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use unftp_core::storage::StorageBackend;
 use uuid::Uuid;
+use crate::ipc::ipc_event::Data;
 
 pub type RepoNoIndex = Repository<OpenStatus>;
 pub type RepoIndexed = Repository<IndexedFullStatus>;

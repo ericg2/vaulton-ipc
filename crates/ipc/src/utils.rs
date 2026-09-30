@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tonic::Status;
 use uuid::Uuid;
+use crate::ipc::Priority;
 
 pub fn map_vfs(e: VfsError) -> Status {
     match e {
@@ -22,6 +23,17 @@ pub fn map_dal(e: Error) -> Status {
         ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
         _ => Status::internal(e.to_string()),
     }
+}
+
+pub fn fix_level(item: log::Level) -> i32 {
+    let ret = match item {
+        log::Level::Error => Priority::Error,
+        log::Level::Warn => Priority::Warning,
+        log::Level::Info => Priority::Info,
+        log::Level::Debug => Priority::Debug,
+        log::Level::Trace => Priority::Debug
+    };
+    ret.into()
 }
 
 // ── Timestamp helpers ─────────────────────────────────────────────────────────

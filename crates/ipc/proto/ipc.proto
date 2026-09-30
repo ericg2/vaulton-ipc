@@ -192,21 +192,28 @@ message JobBarFinished {
   google.protobuf.Timestamp time = 3;
 }
 
-message JobEvent {
+message LogEvent {
+  Priority priority = 1;
+  string message = 2;
+  google.protobuf.Timestamp time = 3;
+}
+
+message IpcEvent {
   oneof data {
-    JobFinishedEvent jobFinished = 1;
-    JobNewMessageEvent jobMessage = 2;
-    JobBarLengthSet jobStepLengthSet = 3;
-    JobBarTitleSet jobStepTitleSet = 4;
-    JobBarIncrement jobStepIncrement = 5;
-    JobBarFinished jobStepFinished = 6;
+    LogEvent logEvent = 1;
+    JobFinishedEvent jobFinished = 2;
+    JobNewMessageEvent jobMessage = 3;
+    JobBarLengthSet jobStepLengthSet = 4;
+    JobBarTitleSet jobStepTitleSet = 5;
+    JobBarIncrement jobStepIncrement = 6;
+    JobBarFinished jobStepFinished = 7;
   }
 }
 
 ///////////////////////////////////////////////////////////////////
 
 message PollResponse {
-  repeated JobEvent events = 1;
+  repeated IpcEvent events = 1;
 }
 
 message JobStartResponse {
