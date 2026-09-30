@@ -429,19 +429,35 @@ impl StorageManager {
     /// and skipped — it never prevents the user's other points from mounting.
     /// Returns `(operator, degraded)`.
     fn create_for_vfs(&self, user: &VfsUser) -> VfsResult<(Operator, bool)> {
+        // `create_for_vfs` itself runs inside `tokio::task::spawn_blocking`,
+        // so there is a Tokio runtime handle available here. The scoped
+        // threads below are plain std::threads, however, and do not inherit
+        // that runtime context automatically.
+        //
+        // OpenDAL's blocking Operator requires a current Tokio runtime handle,
+        // so explicitly enter the runtime on each worker thread.
+        let runtime = tokio::runtime::Handle::current();
+
         let results = std::thread::scope(|scope| {
             user.points
                 .iter()
                 .map(|point| {
                     let point = point.clone();
                     let user = user.clone();
-                    scope.spawn(move || self.build_mount(&user, &point))
+                    let runtime = runtime.clone();
+
+                    scope.spawn(move || {
+                        let _runtime_guard = runtime.enter();
+                        self.build_mount(&user, &point)
+                    })
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|handle| match handle.join() {
                     Ok(result) => result,
-                    Err(_) => Err(VfsError::Internal("point probe thread panicked".into())),
+                    Err(_) => Err(VfsError::Internal(
+                        "point probe thread panicked".into(),
+                    )),
                 })
                 .collect::<Vec<_>>()
         });
@@ -459,11 +475,17 @@ impl StorageManager {
                     } else {
                         vfs.mount(path, op)
                     };
+
                     self.set_health(user, point, PointHealth::Healthy);
                 }
+
                 Err(e) => {
                     degraded = true;
-                    self.set_health(user, point, PointHealth::Failed(e.to_string()));
+                    self.set_health(
+                        user,
+                        point,
+                        PointHealth::Failed(e.to_string()),
+                    );
                 }
             }
         }
