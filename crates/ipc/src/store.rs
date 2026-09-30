@@ -223,7 +223,7 @@ impl StorageManager {
                 point_name: point.name.clone(),
                 health: health as i32,
                 error: err,
-                time: crate::proto_stamp(rustic_core::jiff::Timestamp::now()),
+                time: utils::proto_stamp(rustic_core::jiff::Timestamp::now()),
             }),
         );
     }

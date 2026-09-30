@@ -38,6 +38,7 @@ dashmap = "6.2.1"
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "sqlite-bundled"] }
 futures-lite = "2.6.1"
 opendal-core = { version = "0.59", features = ["blocking"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -201,14 +201,12 @@ impl TryFrom<ProtoVfsPoint> for VfsPoint {
 
 impl From<&VfsPoint> for ProtoVfsPoint {
     fn from(point: &VfsPoint) -> Self {
+        let mut config = point.config.clone();
+        let root = config.remove("root").unwrap_or(String::new());
         let p = ProtoPoint {
             scheme: point.scheme.clone(),
-            config: point.config.clone().into_iter().collect(),
-            root: point
-                .config
-                .get("root")
-                .unwrap_or(&String::new())
-                .to_string(),
+            config: config.into_iter().collect(),
+            root,
         };
 
         let src = if point.is_repo {

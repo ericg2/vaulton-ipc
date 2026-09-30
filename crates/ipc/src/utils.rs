@@ -20,6 +20,14 @@ pub fn map_vfs(e: VfsError) -> Status {
     }
 }
 
+pub fn proto_stamp(ts: rustic_core::jiff::Timestamp) -> Option<Timestamp> {
+    Some(Timestamp {
+        seconds: ts.as_second(),
+        nanos: ts.subsec_nanosecond(),
+    })
+}
+
+
 pub fn map_dal(e: Error) -> Status {
     let message = e.to_string();
     match e.kind() {

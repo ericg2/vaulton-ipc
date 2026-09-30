@@ -1,6 +1,5 @@
 use crate::ipc::{JobBarFinished, JobBarIncrement, JobBarLengthSet, JobBarTitleSet};
 use crate::event_bus::send as send_event;
-use crate::proto_stamp;
 use crossbeam_channel::Sender;
 use rustic_core::jiff::Timestamp;
 use rustic_core::{Progress, ProgressBars, ProgressType, RusticProgress};
@@ -8,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use crate::ipc::ipc_event::Data;
+use crate::utils::proto_stamp;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RepoBar {
