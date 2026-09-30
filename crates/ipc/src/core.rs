@@ -49,11 +49,22 @@ pub enum VfsError {
     #[error("point is a repo mount but has no `repo_password`")]
     RepoPasswordMissing,
 
+    #[error("point '{name}' failed to load: {reason}")]
+    PointFailed { name: String, reason: String },
+
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 pub type VfsResult<T> = Result<T, VfsError>;
+
+/// Load state of a single point, recorded whenever a user's VFS is (re)built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointHealth {
+    Healthy,
+    /// The point could not be initialized/opened; it is left out of the VFS.
+    Failed(String),
+}
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 

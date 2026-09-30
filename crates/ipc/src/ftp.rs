@@ -186,40 +186,27 @@ where
         P: AsRef<Path> + Send + Debug,
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
-        // Local/fs-backed data points measure quota from real on-disk usage
-        // (see `utils::dir_size`) rather than the write-counter `QuotaLayer`
-        // used for every other scheme (that layer is intentionally not
-        // attached to local points any more — see `store::point_operator`).
-        // FTP uploads don't go through the IPC write handlers at all, so
-        // without this check a local point's quota would go completely
-        // unenforced over FTP.
-        //
-        // Caveat: unlike `Vfs_OpenWrite`/`Vfs_WriteAt` (which know the exact
-        // byte range being written and can check before every write), FTP
-        // streams an upload of unknown final size. This can only check that
-        // the point isn't *already* full before the transfer starts — a
-        // large-enough single upload can still push a point over quota
-        // mid-transfer, the same race the old counter-based layer had under
-        // concurrent writers. If you need hard enforcement of an in-flight
-        // upload's size, do it through `Vfs_OpenWrite`/`Vfs_WriteAt` instead,
-        // where each write is checked before it lands.
+        // Local/fs-backed data points with a hard quota cannot safely be
+        // streamed through the FTP backend because its generic AsyncRead API
+        // has no atomic reservation hook. Refuse those uploads rather than
+        // bypassing the quota.
         if let Ok((point, _rest)) = utils::resolve_data_path(user, &path.as_ref().to_string_lossy())
         {
             if utils::is_local_scheme(&point.scheme) {
-                if let Some(max) = point.max_bytes {
-                    let root = PathBuf::from(utils::local_source_path(point).map_err(|e| {
-                        Error::new(ErrorKind::LocalError, e.to_string())
-                    })?);
-                    let used = tokio::task::spawn_blocking(move || utils::dir_size(&root))
-                        .await
-                        .map_err(|e| Error::new(ErrorKind::LocalError, e.to_string()))?
-                        .map_err(|e| Error::new(ErrorKind::LocalError, e.to_string()))?;
-                    if used >= max {
-                        return Err(Error::new(
-                            ErrorKind::PermissionDenied,
-                            format!("point '{}' is already at or over its byte quota", point.name),
-                        ));
-                    }
+                if point.max_bytes.is_some() {
+                    // FTP's StorageBackend::put receives an arbitrary AsyncRead
+                    // and does not expose a pre-write byte reservation hook.
+                    // Refuse this unsafe combination rather than allowing a
+                    // large upload to bypass the filesystem quota. Clients can
+                    // use the IPC write-handle API, which checks each write
+                    // before it reaches disk.
+                    return Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        format!(
+                            "quota-limited local point '{}' requires IPC write handles",
+                            point.name
+                        ),
+                    ));
                 }
             }
         }

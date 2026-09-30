@@ -18,6 +18,19 @@ pub struct DbManager {
     pool: SqlitePool,
 }
 
+fn validate_db_username(username: &str) -> VfsResult<()> {
+    if username.is_empty() || username == "." || username == ".." {
+        return Err(VfsError::Internal("invalid username".into()));
+    }
+    if username
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(VfsError::Internal("username contains an illegal character".into()));
+    }
+    Ok(())
+}
+
 impl DbManager {
     // -----------------------------------------------------------------------
     // Construction
@@ -31,7 +44,7 @@ impl DbManager {
         let path_str = path
             .as_ref()
             .to_str()
-            .expect("database path must be valid UTF-8");
+            .ok_or_else(|| VfsError::Internal("database path must be valid UTF-8".into()))?;
 
         let options = SqliteConnectOptions::from_str(path_str)?
             .create_if_missing(true)
@@ -67,9 +80,19 @@ impl DbManager {
         .execute(&self.pool)
         .await?;
 
-        let _ = sqlx::query("ALTER TABLE users ADD COLUMN password TEXT NOT NULL DEFAULT ''")
+        let has_password: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'password'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        if has_password == 0 {
+            sqlx::query(
+                "ALTER TABLE users ADD COLUMN password TEXT NOT NULL DEFAULT ''",
+            )
             .execute(&self.pool)
-            .await;
+            .await?;
+        }
 
         Ok(())
     }
@@ -80,6 +103,7 @@ impl DbManager {
 
     /// Upsert a single user — inserts if absent, replaces all fields if present.
     pub async fn save_user(&self, user: &VfsUser) -> VfsResult<()> {
+        validate_db_username(&user.username)?;
         let points_json = serde_json::to_string(&user.points)?;
 
         sqlx::query(
@@ -129,6 +153,16 @@ impl UserSystem for DbManager {
     }
 
     async fn set_users(&self, users: Vec<VfsUser>) -> VfsResult<()> {
+        let mut usernames = std::collections::HashSet::new();
+        for user in &users {
+            validate_db_username(&user.username)?;
+            if !usernames.insert(user.username.as_str()) {
+                return Err(VfsError::Internal(format!(
+                    "duplicate username '{}'", user.username
+                )));
+            }
+        }
+
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM users").execute(&mut *tx).await?;
 
@@ -179,7 +213,12 @@ impl QuotaTracker for DbManager {
         "#,
         )
         .bind(id)
-        .bind(bytes as i64) // Changed to i64 to prevent truncation errors
+        .bind(i64::try_from(bytes).map_err(|_| {
+            opendal_core::Error::new(
+                ErrorKind::ConfigInvalid,
+                "quota byte count exceeds SQLite INTEGER range",
+            )
+        })?)
         .execute(&self.pool)
         .await
         .map_err(db_err("set bytes quota"))?;
@@ -198,8 +237,16 @@ impl QuotaTracker for DbManager {
                     .set_temporary()
             })?;
 
-        // Unknown id → 0. Cast i64 → u64 is safe: we never store negatives.
-        Ok(row.map(|(b,)| b as u64).unwrap_or(0))
+        // Unknown id → 0. Negative persisted values indicate database
+        // corruption rather than a valid quota.
+        match row {
+            None => Ok(0),
+            Some((bytes,)) if bytes >= 0 => Ok(bytes as u64),
+            Some(_) => Err(opendal_core::Error::new(
+                ErrorKind::Unexpected,
+                "quota contains a negative byte count",
+            )),
+        }
     }
 
     async fn clear(&self, id: &str) -> opendal_core::Result<()> {

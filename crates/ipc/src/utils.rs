@@ -13,16 +13,105 @@ use crate::ipc::Priority;
 pub fn map_vfs(e: VfsError) -> Status {
     match e {
         VfsError::UserNotFound => Status::not_found("vfs user not found"),
+        VfsError::RepoPasswordMissing => Status::failed_precondition(e.to_string()),
+        VfsError::PointFailed { .. } => Status::failed_precondition(e.to_string()),
+        VfsError::OpenDal(e) => map_dal(e),
         _ => Status::internal(e.to_string()),
     }
 }
 
 pub fn map_dal(e: Error) -> Status {
+    let message = e.to_string();
     match e.kind() {
-        ErrorKind::NotFound => Status::not_found(e.to_string()),
-        ErrorKind::PermissionDenied => Status::permission_denied(e.to_string()),
-        _ => Status::internal(e.to_string()),
+        ErrorKind::NotFound => Status::not_found(message),
+        ErrorKind::PermissionDenied => Status::permission_denied(message),
+        ErrorKind::RateLimited => Status::resource_exhausted(message),
+        ErrorKind::ConfigInvalid => Status::invalid_argument(message),
+        ErrorKind::Unsupported => Status::unimplemented(message),
+        ErrorKind::AlreadyExists => Status::already_exists(message),
+        _ => Status::internal(message),
     }
+}
+
+/// Validates the username constraints that are required by both VFS paths and
+/// quota keys. Rejecting separators here prevents ambiguous identities later.
+pub fn validate_username(username: &str) -> Result<(), Status> {
+    if username.is_empty() || username == "." || username == ".." {
+        return Err(Status::invalid_argument("username must not be empty or dot"));
+    }
+    if username
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(Status::invalid_argument("username contains an illegal character"));
+    }
+    Ok(())
+}
+
+pub fn validate_repo_password(password: &str) -> Result<(), Status> {
+    if password.is_empty() {
+        return Err(Status::invalid_argument("repository password must not be empty"));
+    }
+    if password.chars().any(|c| c.is_control()) {
+        return Err(Status::invalid_argument("repository password contains a control character"));
+    }
+    Ok(())
+}
+
+/// Joins `rest` onto `root`, rejecting `..`, absolute and prefix components so
+/// a client can never escape a local point's root directory.
+pub fn safe_join(root: &Path, rest: &str) -> Result<PathBuf, Status> {
+    use std::path::Component;
+
+    let mut out = root.to_path_buf();
+    for c in Path::new(rest).components() {
+        match c {
+            Component::Normal(p) => {
+                out.push(p);
+                // Lexical `..` protection is not enough when a client can
+                // address a symlink inside the point. Reject symlink
+                // components so a configured local point cannot be escaped
+                // through the filesystem namespace. Missing final components
+                // are fine; they are created by the caller when appropriate.
+                match std::fs::symlink_metadata(&out) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(Status::permission_denied(format!(
+                            "path crosses a symlink: '{}'",
+                            out.display()
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Status::internal(format!(
+                        "failed to inspect local path '{}': {e}", out.display()
+                    ))),
+                }
+            }
+            Component::CurDir | Component::RootDir => {}
+            _ => return Err(Status::invalid_argument(format!("illegal path '{rest}'"))),
+        }
+    }
+    Ok(out)
+}
+
+pub fn validate_relative_point_path(rest: &str) -> Result<String, Status> {
+    use std::path::Component;
+
+    let normalized_separators = rest.replace('\\', "/");
+    let mut out = PathBuf::new();
+    for component in Path::new(&normalized_separators).components() {
+        match component {
+            Component::Normal(value) => out.push(value),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(Status::invalid_argument(format!(
+                    "illegal point-relative path '{rest}'"
+                )));
+            }
+        }
+    }
+
+    Ok(out.to_string_lossy().replace('\\', "/"))
 }
 
 pub fn fix_level(item: log::Level) -> i32 {
@@ -227,6 +316,39 @@ pub fn is_local_scheme(scheme: &str) -> bool {
 /// Symlinks are skipped (neither followed nor counted) to avoid cycles and
 /// double-counting; a missing `root` is treated as zero bytes rather than
 /// an error, since a point's directory may not have been created yet.
+pub fn reject_symlinks_under(root: &Path) -> std::io::Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let ty = match entry.file_type() {
+                Ok(ty) => ty,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if ty.is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("symlink is not allowed under '{}'", root.display()),
+                ));
+            }
+            if ty.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn dir_size(root: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
@@ -239,12 +361,31 @@ pub fn dir_size(root: &Path) -> std::io::Result<u64> {
         };
 
         for entry in entries {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
             if file_type.is_dir() {
                 stack.push(entry.path());
             } else if file_type.is_file() {
-                total += entry.metadata()?.len();
+                match entry.metadata() {
+                    Ok(meta) => {
+                        total = total.checked_add(meta.len()).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "directory size exceeds u64::MAX",
+                            )
+                        })?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
@@ -273,6 +414,7 @@ pub fn repo_source(point: &VfsPoint) -> Result<RepoSource, Status> {
     let password = point.repo_password.clone().ok_or_else(|| {
         Status::invalid_argument(format!("repo point '{}' is missing a password", point.name))
     })?;
+    validate_repo_password(&password)?;
 
     Ok(RepoSource {
         scheme: point.scheme.clone(),
@@ -307,6 +449,7 @@ pub fn resolve_repo_point(user: &VfsUser, repo_id: &str) -> Result<RepoSource, S
 /// [`StorageSystem::get_data_operator`](crate::store::StorageSystem::get_data_operator)
 /// for new call sites — that path applies the same read-only/quota layering
 /// as the rest of the VFS, whereas this raw config bypasses both.
+#[deprecated(note = "use require_data_point plus StorageSystem::get_data_operator; this helper bypasses policy layers")]
 pub fn resolve_data_point(
     user: &VfsUser,
     point_name: &str,
@@ -336,8 +479,8 @@ pub fn resolve_data_file_path<'a>(
     match path.path.as_ref() {
         Some(FilePathKind::Indexed(indexed)) => {
             let point = require_data_point_id(user, &indexed.point_id)?;
-            let point_path = indexed.point_path.trim_start_matches('/');
-            Ok((point, point_path.to_string()))
+            let point_path = validate_relative_point_path(&indexed.point_path)?;
+            Ok((point, point_path))
         }
         Some(FilePathKind::Virtual(virtual_path)) => {
             let trimmed = virtual_path.trim_start_matches('/');
@@ -356,7 +499,8 @@ pub fn resolve_data_file_path<'a>(
             })?;
             let rest = parts.next().unwrap_or("");
             let point = require_data_point(user, point_name)?;
-            Ok((point, rest.trim_start_matches('/').to_string()))
+            let rest = validate_relative_point_path(rest)?;
+            Ok((point, rest))
         }
         None => Err(Status::invalid_argument("path is blank")),
     }
@@ -382,6 +526,7 @@ pub fn resolve_data_path<'a>(
 
     let rest = parts.next().unwrap_or("");
     let point = require_data_point(user, point_name)?;
+    let rest = validate_relative_point_path(rest)?;
     Ok((point, PathBuf::from(rest)))
 }
 
@@ -437,6 +582,13 @@ mod tests {
             password: "pw".into(),
             points,
         }
+    }
+
+    #[test]
+    fn validate_username_rejects_path_separators() {
+        assert!(validate_username("alice/bob").is_err());
+        assert!(validate_username("alice\\bob").is_err());
+        assert!(validate_username("alice").is_ok());
     }
 
     #[test]

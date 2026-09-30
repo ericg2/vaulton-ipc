@@ -1,12 +1,17 @@
 //! [`StorageManager`] — unified cache for rustic repositories, VFS operators,
 //! and raw data-layer operators.
 
-use crate::core::{VfsError, VfsPoint, VfsResult, VfsUser};
+use crate::core::{PointHealth, VfsError, VfsPoint, VfsResult, VfsUser};
 use crate::db::DbManager;
+use crate::event_bus::send as send_event;
+use crate::ipc::PointStatusEvent;
+use crate::ipc::ipc_event::Data;
 use crate::progress::RusticProgressBars;
 use crate::utils;
 use async_trait::async_trait;
 use crossbeam_channel::Sender;
+use dashmap::DashMap;
+use log::{error, info};
 use moka::sync::Cache;
 use opendal_core::Operator;
 use opendal_vfs::layers::quota::{QuotaLayer, QuotaState};
@@ -21,11 +26,10 @@ use rustic_core::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use unftp_core::storage::StorageBackend;
 use uuid::Uuid;
-use crate::ipc::ipc_event::Data;
 
 pub type RepoNoIndex = Repository<OpenStatus>;
 pub type RepoIndexed = Repository<IndexedFullStatus>;
@@ -39,6 +43,10 @@ pub type RepoIndexed = Repository<IndexedFullStatus>;
 ///   storage (S3, local disk, etc.), independent of any rustic repo.
 #[async_trait]
 pub trait StorageSystem: Send + Sync + 'static {
+    async fn build_vfs(&self, user: VfsUser) -> VfsResult<Operator>;
+
+    fn refresh_degraded(&self, user: VfsUser);
+
     /// Returns a cached, indexed rustic repository for the given source.
     ///
     /// Opens the repository on first access; subsequent calls for the same
@@ -50,19 +58,27 @@ pub trait StorageSystem: Send + Sync + 'static {
     ///
     /// Results are **not** cached — each call produces a new handle so that
     /// progress reporting is scoped to the job lifetime.
+    ///
+    /// `allow_init` controls whether a *missing* repository is created. It is
+    /// only ever `true` for backups; restore/check/forget must fail loudly
+    /// instead of silently creating an empty repo.
     async fn get_repo_job(
         &self,
         src: &RepoSource,
         op: opendal_core::blocking::Operator,
         job_id: Uuid,
         tx: Sender<Data>,
+        allow_init: bool,
     ) -> RusticResult<RepoIndexed>;
 
     /// Creates a VFS for the given user.
     async fn get_vfs(&self, user: &VfsUser) -> VfsResult<Operator>;
 
-    /// Removes the VFS instance for a user.
+    /// Removes the VFS instance for a user (healthy and degraded caches).
     fn invalidate_vfs(&self, user: &VfsUser);
+
+    /// Last recorded load state of a point, or `None` if never loaded.
+    fn point_health(&self, id: &Uuid) -> Option<PointHealth>;
 
     /// Builds an operator for a single named data point belonging to `user`,
     /// applying the same read-only/quota layering as [`get_vfs`](Self::get_vfs)
@@ -102,18 +118,62 @@ pub struct RepoSource {
 #[derive(Clone)]
 pub struct StorageManager {
     repos: Cache<RepoSource, Arc<RepoIndexed>>,
-    vfs_ops: Cache<VfsUser, Operator>,
+    repo_vfs_ops: Cache<RepoSource, Operator>,
+    data_ops: Cache<Uuid, opendal_core::blocking::Operator>,
+    vfs_ops: Cache<String, Operator>,
+    /// VFS trees built while at least one point failed. Short TTL so failed
+    /// points are retried soon without re-initializing on every request.
+    degraded_ops: Cache<String, Operator>,
+    health: Arc<DashMap<Uuid, PointHealth>>,
+    repo_locks: Arc<DashMap<RepoSource, Arc<StdMutex<()>>>>,
+    vfs_build_locks: Arc<DashMap<String, Arc<StdMutex<()>>>>,
+    vfs_generation: Arc<DashMap<String, u64>>,
+    refreshing: Arc<DashMap<String, ()>>,
+    events: Sender<Data>,
     pub(crate) state: QuotaState,
+}
+
+/// How long a partially-failed VFS is served before points are retried.
+const DEGRADED_TTL: Duration = Duration::from_secs(30);
+
+fn repo_err(msg: impl Into<String>) -> Box<RusticError> {
+    let msg = msg.into();
+    RusticError::with_source(ErrorKind::Backend, msg.clone(), std::io::Error::other(msg))
+}
+
+/// A rustic repository exists iff its `config` file does. Any error other
+/// than NotFound (network, auth, bad config) is returned as-is instead of
+/// being mistaken for "repo missing" and triggering a bogus `init`.
+fn repo_exists(op: &opendal_core::blocking::Operator) -> RusticResult<bool> {
+    match op.stat("config") {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == opendal_core::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(RusticError::with_source(
+            ErrorKind::Backend,
+            format!("repository probe failed: {e}"),
+            e,
+        )),
+    }
 }
 
 impl StorageManager {
     /// Creates a new [`StorageManager`] whose caches evict entries after
     /// `tti` of inactivity.
-    pub fn new(db: Arc<DbManager>, tti: Duration) -> Self {
+    pub fn new(db: Arc<DbManager>, tti: Duration, events: Sender<Data>) -> Self {
         Self {
             repos: Cache::builder()
                 .time_to_idle(tti)
                 .max_capacity(1000)
+                .build(),
+
+            repo_vfs_ops: Cache::builder()
+                .time_to_idle(tti)
+                .max_capacity(1000)
+                .build(),
+
+            data_ops: Cache::builder()
+                .time_to_idle(tti)
+                .max_capacity(2000)
                 .build(),
 
             vfs_ops: Cache::builder()
@@ -121,79 +181,131 @@ impl StorageManager {
                 .max_capacity(1000)
                 .build(),
 
+            degraded_ops: Cache::builder()
+                .time_to_live(DEGRADED_TTL)
+                .max_capacity(1000)
+                .build(),
+
+            health: Arc::new(DashMap::new()),
+            repo_locks: Arc::new(DashMap::new()),
+            vfs_build_locks: Arc::new(DashMap::new()),
+            vfs_generation: Arc::new(DashMap::new()),
+            refreshing: Arc::new(DashMap::new()),
+            events,
             state: QuotaState::new(db.clone()),
         }
     }
 
+    /// Records a point's health; logs and emits a `PointStatusEvent` only on change.
+    fn set_health(&self, user: &VfsUser, point: &VfsPoint, new: PointHealth) {
+        let changed = self.health.insert(point.id, new.clone()).as_ref() != Some(&new);
+        if !changed {
+            return;
+        }
+        let (health, err) = match &new {
+            PointHealth::Healthy => {
+                info!("point '{}' of user '{}' loaded", point.name, user.username);
+                (crate::ipc::PointHealth::Healthy, String::new())
+            }
+            PointHealth::Failed(e) => {
+                error!(
+                    "point '{}' of user '{}' failed: {e}",
+                    point.name, user.username
+                );
+                (crate::ipc::PointHealth::Failed, e.clone())
+            }
+        };
+        let _ = send_event(
+            &self.events,
+            Data::PointStatus(PointStatusEvent {
+                user: user.username.clone(),
+                point_id: point.id.to_string(),
+                point_name: point.name.clone(),
+                health: health as i32,
+                error: err,
+                time: crate::proto_stamp(rustic_core::jiff::Timestamp::now()),
+            }),
+        );
+    }
+
     // ── Repository helpers ────────────────────────────────────────────────
-    /// Opens or initialises a rustic repository **without** a progress bar.
-    ///
-    /// When `init` is `true` the repository is created fresh via
-    /// [`Repository::init`]; otherwise it is opened from existing storage.
-    fn create_indexed(&self, src: &RepoSource, init: bool) -> RusticResult<RepoIndexed> {
+
+    fn probe(src: &RepoSource) -> RusticResult<opendal_core::blocking::Operator> {
+        let op = Operator::via_iter(&src.scheme, src.config.clone())
+            .and_then(opendal_core::blocking::Operator::new)
+            .map_err(|e| {
+                RusticError::with_source(ErrorKind::Backend, "Invalid storage config", e)
+            })?;
+        Ok(op)
+    }
+
+    /// Probes repository storage and initializes a missing repository when
+    /// permitted. Existing repositories are not opened here: the caller that
+    /// needs the actual rustic handle performs the real open exactly once.
+    fn prepare_repo_unlocked(&self, src: &RepoSource, allow_init: bool) -> RusticResult<()> {
+        let op = Self::probe(src)?;
+        if repo_exists(&op)? {
+            return Ok(());
+        }
+
+        if !allow_init {
+            return Err(repo_err(
+                "repository does not exist (and this point is read-only)",
+            ));
+        }
+
         let creds = Credentials::password(&src.password);
         let config = OpenDALConfig::default()
             .scheme(src.scheme.clone())
             .options(src.config.clone().into_iter().collect::<HashMap<_, _>>());
         let backend = BackendOptions::default().with_repo(&config).to_backends()?;
-        let repo = Repository::new(&RepositoryOptions::default(), &backend)?;
-        if init {
-            repo.init(&creds, &KeyOptions::default(), &ConfigOptions::default())?
-                .to_indexed()
-        } else {
-            repo.open(&creds)?.to_indexed()
-        }
+
+        info!("initializing new repository ({})", src.scheme);
+        Repository::new(&RepositoryOptions::default(), &backend)?.init(
+            &creds,
+            &KeyOptions::default(),
+            &ConfigOptions::default(),
+        )?;
+
+        Ok(())
     }
 
-    /// Opens or initialises a rustic repository **with** job-scoped progress
-    /// events forwarded over `tx`.
+    /// Opens an existing repository, creating it only if `allow_init`.
+    /// The caller owns the repository lock when this is used by `get_repo`.
+    fn get_raw_repo(&self, src: &RepoSource, allow_init: bool) -> RusticResult<RepoIndexed> {
+        self.prepare_repo_unlocked(src, allow_init)?;
+        let creds = Credentials::password(&src.password);
+        let config = OpenDALConfig::default()
+            .scheme(src.scheme.clone())
+            .options(src.config.clone().into_iter().collect::<HashMap<_, _>>());
+        let backend = BackendOptions::default().with_repo(&config).to_backends()?;
+        Repository::new(&RepositoryOptions::default(), &backend)?
+            .open(&creds)?
+            .to_indexed()
+    }
+
+    /// Job-scoped variant with progress events over `tx`.
     fn create_for_job(
         &self,
         src: &RepoSource,
         op: opendal_core::blocking::Operator,
         job_id: Uuid,
         tx: Sender<Data>,
-        init: bool,
+        allow_init: bool,
     ) -> RusticResult<RepoIndexed> {
+        let exists = repo_exists(&op)?;
         let creds = Credentials::password(&src.password);
-        let config = OpenDALSource::new(op);
-        let backend = config.to_backends()?;
+        let backend = OpenDALSource::new(op).to_backends()?;
         let pb = RusticProgressBars::new(job_id, tx);
         let repo = Repository::new_with_progress(&RepositoryOptions::default(), &backend, pb)?;
-        if init {
+        if exists {
+            repo.open(&creds)?.to_indexed()
+        } else if allow_init {
             repo.init(&creds, &KeyOptions::default(), &ConfigOptions::default())?
                 .to_indexed()
         } else {
-            repo.open(&creds)?.to_indexed()
+            Err(repo_err("repository does not exist"))
         }
-    }
-
-    /// Tries to open an existing repository, falling back to `init` on
-    /// failure (e.g. first run against empty storage).
-    fn get_raw_repo(&self, src: &RepoSource) -> RusticResult<RepoIndexed> {
-        self.create_indexed(src, false)
-            .or_else(|_| self.create_indexed(src, true))
-    }
-
-    // ── VFS operator helpers ──────────────────────────────────────────────
-
-    /// Builds a fresh OpenDAL [`Operator`] for VFS access to the given
-    /// repository source via [`RusticVfsBuilder`].
-    fn create_vfs_operator(&self, src: &RepoSource) -> RusticResult<Operator> {
-        // Ensure the repo exists, initializing it if this is the first access.
-        self.get_raw_repo(src)?;
-
-        let config = OpenDALConfig::default()
-            .scheme(src.scheme.clone())
-            .options(src.config.clone().into_iter().collect::<HashMap<_, _>>());
-        let op = Operator::new(
-            RusticVfsBuilder::default()
-                .with_options(RepositoryOptions::default())
-                .with_backend(BackendOptions::default().with_repo(&config))
-                .with_credentials(Credentials::password(&src.password)),
-        )
-            .map_err(|e| RusticError::with_source(ErrorKind::Vfs, "Failed to initialize VFS", e))?;
-        Ok(op)
     }
 
     /// Builds a single-point operator with the read-only/quota policy from
@@ -239,53 +351,127 @@ impl StorageManager {
         Ok(op)
     }
 
-    fn create_for_vfs(&self, user: &VfsUser) -> VfsResult<Operator> {
+    /// Builds one mount. Any failure here only affects this point.
+    fn build_mount(&self, user: &VfsUser, point: &VfsPoint) -> VfsResult<(String, Operator)> {
+        if !point.is_repo {
+            let op = self.point_operator(user, point)?;
+            let probe = opendal_core::blocking::Operator::new(op.clone())?;
+            match probe.list("") {
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == opendal_core::ErrorKind::NotFound
+                        && utils::is_local_scheme(&point.scheme) =>
+                {
+                    let root = utils::local_source_path(point)
+                        .map_err(|status| VfsError::Internal(status.to_string()))?;
+                    std::fs::create_dir_all(root).map_err(|e| {
+                        VfsError::Internal(format!("failed to create local point root: {e}"))
+                    })?;
+                }
+                Err(e) if e.kind() == opendal_core::ErrorKind::Unsupported => {
+                    // Some backends do not implement root listing. A root stat
+                    // is a cheaper fallback that still proves the backend is
+                    // reachable.
+                    probe.stat("")?;
+                }
+                Err(e) => return Err(VfsError::OpenDal(e)),
+            }
+            return Ok((utils::data_mount_path(&point.name), op));
+        }
+
+        let pass = point
+            .repo_password
+            .clone()
+            .ok_or(VfsError::RepoPasswordMissing)?;
+        let src = RepoSource {
+            scheme: point.scheme.clone(),
+            config: point.config.clone(),
+            password: pass.clone(),
+        };
+        if let Some(op) = self.repo_vfs_ops.get(&src) {
+            return Ok((utils::repo_mount_path(&point.name), op));
+        }
+
+        // Serialize preparation and VFS repository construction by the same
+        // source key. Otherwise parallel user-cache rebuilds can all perform
+        // the same credential/probe/open work at once.
+        let lock = self
+            .repo_locks
+            .entry(src.clone())
+            .or_insert_with(|| Arc::new(StdMutex::new(())))
+            .clone();
+        let _guard = lock
+            .lock()
+            .map_err(|_| VfsError::Internal("repository VFS lock poisoned".into()))?;
+
+        if let Some(op) = self.repo_vfs_ops.get(&src) {
+            return Ok((utils::repo_mount_path(&point.name), op));
+        }
+
+        // Read-only repo points must never be created implicitly.
+        self.prepare_repo_unlocked(&src, !point.read_only)
+            .map_err(|e| VfsError::Storage(e))?;
+
+        let config = OpenDALConfig::default()
+            .scheme(point.scheme.clone())
+            .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
+        let op = Operator::from_config(RusticVfsConfig {
+            options: RepositoryOptions::default(),
+            backend: BackendOptions::default().with_repo(&config),
+            credentials: Some(Credentials::password(&pass)),
+            refresh_interval: Some(Duration::from_mins(2)),
+        })?;
+        self.repo_vfs_ops.insert(src, op.clone());
+        Ok((utils::repo_mount_path(&point.name), op))
+    }
+
+    /// Builds the user's VFS. A point that fails to load is recorded, logged
+    /// and skipped — it never prevents the user's other points from mounting.
+    /// Returns `(operator, degraded)`.
+    fn create_for_vfs(&self, user: &VfsUser) -> VfsResult<(Operator, bool)> {
+        let results = std::thread::scope(|scope| {
+            user.points
+                .iter()
+                .map(|point| {
+                    let point = point.clone();
+                    let user = user.clone();
+                    scope.spawn(move || self.build_mount(&user, &point))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(VfsError::Internal("point probe thread panicked".into())),
+                })
+                .collect::<Vec<_>>()
+        });
+
         let mut vfs = VfsBuilder::new(self.state.clone());
-        for point in user.points.iter() {
-            if point.is_repo {
-                let pass = point
-                    .repo_password
-                    .clone()
-                    .ok_or(VfsError::RepoPasswordMissing)?;
+        let mut degraded = false;
 
-                let config = OpenDALConfig::default()
-                    .scheme(point.scheme.clone())
-                    .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
-
-                let scheme = RusticVfsConfig {
-                    options: RepositoryOptions::default(),
-                    backend: BackendOptions::default().with_repo(&config),
-                    credentials: Some(Credentials::password(&pass)),
-                    refresh_interval: Some(Duration::from_mins(2)),
-                };
-
-                // 9-28-28: Ensure the repository exists and is loaded first.
-                let src = RepoSource {
-                    scheme: point.scheme.clone(),
-                    config: point.config.clone(),
-                    password: pass.clone(),
-                };
-
-                self.get_raw_repo(&src)?;
-                let op = Operator::from_config(scheme)?;
-                // Repo mounts are always read-only inside the VFS tree,
-                // independent of `point.read_only` — that flag instead gates
-                // whether backup/forget jobs may write to the repo (see
-                // `utils::require_writable`).
-                vfs = vfs
-                    .mount(utils::repo_mount_path(&point.name), op)
-                    .read_only();
-            } else {
-                // `point_operator` already applies read-only/quota layers
-                // directly, so this mount is added with no further
-                // `.read_only()`/`.quota()` calls — that keeps the policy
-                // identical between the full VFS tree and standalone job
-                // operators (`get_data_operator`) with no duplicated logic.
-                let op = self.point_operator(user, point)?;
-                vfs = vfs.mount(utils::data_mount_path(&point.name), op);
+        for (point, result) in user.points.iter().zip(results) {
+            match result {
+                Ok((path, op)) => {
+                    // Repo mounts are always read-only inside the VFS tree;
+                    // `point.read_only` gates backup/forget jobs instead.
+                    vfs = if point.is_repo {
+                        vfs.mount(path, op).read_only()
+                    } else {
+                        vfs.mount(path, op)
+                    };
+                    self.set_health(user, point, PointHealth::Healthy);
+                }
+                Err(e) => {
+                    degraded = true;
+                    self.set_health(user, point, PointHealth::Failed(e.to_string()));
+                }
             }
         }
-        Ok(Operator::new(vfs)?)
+
+        // An empty or completely failed mount set is still a valid VFS.
+        // Individual point failures are represented by health state rather
+        // than turning the whole user into an authentication failure.
+        Ok((Operator::new(vfs)?, degraded))
     }
 }
 
@@ -295,19 +481,31 @@ impl StorageSystem for StorageManager {
         if let Some(repo) = self.repos.get(src) {
             return Ok(repo);
         }
+
         let this = self.clone();
         let src = src.clone();
         tokio::task::spawn_blocking(move || {
-            // check again inside — another task may have populated it while we waited
+            let lock = this
+                .repo_locks
+                .entry(src.clone())
+                .or_insert_with(|| Arc::new(StdMutex::new(())))
+                .clone();
+            let _guard = lock
+                .lock()
+                .map_err(|_| repo_err("repository open lock poisoned"))?;
+
             if let Some(repo) = this.repos.get(&src) {
                 return Ok(repo);
             }
-            let repo = Arc::new(this.get_raw_repo(&src)?);
-            this.repos.insert(src, repo.clone());
-            Ok(repo)
+
+            let result = this.get_raw_repo(&src, false).map(Arc::new);
+            if let Ok(repo) = &result {
+                this.repos.insert(src.clone(), repo.clone());
+            }
+            result
         })
-            .await
-            .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+        .await
+        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
     }
 
     async fn get_repo_job(
@@ -316,35 +514,120 @@ impl StorageSystem for StorageManager {
         operator: opendal_core::blocking::Operator,
         job_id: Uuid,
         tx: Sender<Data>,
+        allow_init: bool,
     ) -> RusticResult<RepoIndexed> {
         let this = self.clone();
         let src = src.clone();
         tokio::task::spawn_blocking(move || {
-            this.create_for_job(&src, operator.clone(), job_id, tx.clone(), false)
-                .or_else(|_| this.create_for_job(&src, operator, job_id, tx, true))
+            this.create_for_job(&src, operator, job_id, tx, allow_init)
         })
-            .await
-            .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+        .await
+        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
     }
 
     async fn get_vfs(&self, user: &VfsUser) -> VfsResult<Operator> {
-        if let Some(op) = self.vfs_ops.get(user) {
+        let key = user.username.clone();
+        if let Some(op) = self.vfs_ops.get(&key) {
             return Ok(op);
         }
 
+        // A degraded VFS is intentionally usable while an asynchronous refresh
+        // retries unhealthy points. This prevents a transient storage outage
+        // from turning into an authentication/VFS outage for the whole user.
+        if let Some(op) = self.degraded_ops.get(&key) {
+            self.refresh_degraded(user.clone());
+            return Ok(op);
+        }
+
+        self.build_vfs(user.clone()).await
+    }
+
+    fn refresh_degraded(&self, user: VfsUser) {
+        let key = user.username.clone();
+        if self.refreshing.insert(key.clone(), ()).is_some() {
+            return;
+        }
+
         let this = self.clone();
-        let user = user.clone();
+        tokio::spawn(async move {
+            let result = this.build_vfs(user).await;
+            if let Err(e) = result {
+                log::warn!("background VFS refresh for '{key}' failed: {e}");
+            }
+            this.refreshing.remove(&key);
+        });
+    }
+
+    async fn build_vfs(&self, user: VfsUser) -> VfsResult<Operator> {
+        let key = user.username.clone();
+        let this = self.clone();
         tokio::task::spawn_blocking(move || {
-            let op = this.create_for_vfs(&user)?;
-            this.vfs_ops.insert(user.clone(), op.clone());
+            let lock = this
+                .vfs_build_locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(StdMutex::new(())))
+                .clone();
+            let _guard = lock
+                .lock()
+                .map_err(|_| VfsError::Internal("VFS build lock poisoned".into()))?;
+
+            if let Some(op) = this.vfs_ops.get(&key) {
+                return Ok(op);
+            }
+
+            let generation = this.vfs_generation.get(&key).map(|v| *v).unwrap_or(0);
+            let (op, degraded) = this.create_for_vfs(&user)?;
+
+            // Configuration may have changed while the blocking probes ran.
+            // Never put a stale user configuration back into the cache.
+            let current_generation = this.vfs_generation.get(&key).map(|v| *v).unwrap_or(0);
+            if generation != current_generation {
+                return Ok(op);
+            }
+
+            if degraded {
+                this.vfs_ops.invalidate(&key);
+                this.degraded_ops.insert(key, op.clone());
+            } else {
+                this.degraded_ops.invalidate(&key);
+                this.vfs_ops.insert(key, op.clone());
+            }
             Ok(op)
         })
-            .await
-            .map_err(|e| VfsError::Internal(format!("spawn_blocking panicked: {e}")))?
+        .await
+        .map_err(|e| VfsError::Internal(format!("spawn_blocking panicked: {e}")))?
     }
 
     fn invalidate_vfs(&self, user: &VfsUser) {
-        self.vfs_ops.invalidate(user);
+        self.vfs_generation
+            .entry(user.username.clone())
+            .and_modify(|generation| *generation = generation.saturating_add(1))
+            .or_insert(1);
+        self.vfs_ops.invalidate(&user.username);
+        self.degraded_ops.invalidate(&user.username);
+
+        // A health entry belongs to a particular point configuration. Remove
+        // it when that user's configuration changes so a reused point ID
+        // starts from UNKNOWN instead of inheriting an old failure.
+        for point in &user.points {
+            self.health.remove(&point.id);
+            self.data_ops.invalidate(&point.id);
+            if point.is_repo {
+                if let Some(password) = &point.repo_password {
+                    let src = RepoSource {
+                        scheme: point.scheme.clone(),
+                        config: point.config.clone(),
+                        password: password.clone(),
+                    };
+                    self.repo_vfs_ops.invalidate(&src);
+                    self.repos.invalidate(&src);
+                }
+            }
+        }
+    }
+
+    fn point_health(&self, id: &Uuid) -> Option<PointHealth> {
+        self.health.get(id).map(|h| h.clone())
     }
 
     fn get_data_operator(
@@ -352,8 +635,13 @@ impl StorageSystem for StorageManager {
         user: &VfsUser,
         point: &VfsPoint,
     ) -> VfsResult<opendal_core::blocking::Operator> {
+        if let Some(op) = self.data_ops.get(&point.id) {
+            return Ok(op);
+        }
+
         let op = self.point_operator(user, point)?;
         let x = opendal_core::blocking::Operator::new(op)?;
+        self.data_ops.insert(point.id, x.clone());
         Ok(x)
     }
 }
@@ -373,7 +661,11 @@ mod tests {
                 .await
                 .expect("open in-memory db"),
         );
-        StorageManager::new(db, Duration::from_secs(60))
+        StorageManager::new(
+            db,
+            Duration::from_secs(60),
+            crossbeam_channel::unbounded().0,
+        )
     }
 
     fn memory_point(name: &str, read_only: bool, max_bytes: Option<u64>) -> VfsPoint {

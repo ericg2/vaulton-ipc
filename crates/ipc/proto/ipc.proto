@@ -25,10 +25,19 @@ message VfsPoint {
   }
 }
 
+enum PointHealth {
+  POINT_HEALTH_UNKNOWN = 0; // not loaded yet
+  POINT_HEALTH_HEALTHY = 1;
+  POINT_HEALTH_FAILED = 2;  // see `error`; the point is NOT mounted in the user's VFS
+}
+
 message VfsInfo {
   string user = 1;
   VfsPoint point = 2;
   uint64 used_bytes = 3;
+  PointHealth health = 4;
+  // Human-readable reason when health == FAILED (init/open/config/quota-scan error).
+  string error = 5;
 }
 
 message VfsUser {
@@ -156,6 +165,8 @@ message JobFinishedEvent {
   bool success = 2;
   optional string snapshot = 3;
   google.protobuf.Timestamp time = 4;
+  // Set when success == false.
+  optional string error = 5;
 }
 
 message JobNewMessageEvent {
@@ -198,6 +209,17 @@ message LogEvent {
   google.protobuf.Timestamp time = 3;
 }
 
+// Emitted whenever a point's health changes while (re)building a user's VFS
+// or initializing a repository.
+message PointStatusEvent {
+  string user = 1;
+  string point_id = 2;
+  string point_name = 3;
+  PointHealth health = 4;
+  string error = 5;
+  google.protobuf.Timestamp time = 6;
+}
+
 message IpcEvent {
   oneof data {
     LogEvent logEvent = 1;
@@ -207,6 +229,7 @@ message IpcEvent {
     JobBarTitleSet jobStepTitleSet = 5;
     JobBarIncrement jobStepIncrement = 6;
     JobBarFinished jobStepFinished = 7;
+    PointStatusEvent pointStatus = 8;
   }
 }
 
@@ -302,6 +325,11 @@ message InfoResponse {
 }
 
 
+// Drops the cached VFS for `user` and rebuilds it (retrying failed points).
+message ReloadArgs {
+  string user = 1;
+}
+
 message Empty {}
 
 service IpcService {
@@ -314,6 +342,7 @@ service IpcService {
   rpc Poll(Empty) returns (PollResponse);
   rpc SetVfs(SetVfsArgs) returns (Empty);
   rpc GetVfs(Empty) returns (InfoResponse);
+  rpc ReloadVfs(ReloadArgs) returns (InfoResponse); // returns that user's points w/ fresh health
 
   rpc Vfs_ReadFile(ReadVfsArgs) returns (ReadVfsResponse);
   rpc Vfs_TouchFile(FilePath) returns (Empty);

@@ -1,8 +1,11 @@
 use crate::ipc::{JobBarFinished, JobBarIncrement, JobBarLengthSet, JobBarTitleSet};
+use crate::event_bus::send as send_event;
 use crate::proto_stamp;
 use crossbeam_channel::Sender;
 use rustic_core::jiff::Timestamp;
 use rustic_core::{Progress, ProgressBars, ProgressType, RusticProgress};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use crate::ipc::ipc_event::Data;
 
@@ -18,6 +21,38 @@ pub struct TxProgress {
     bar: RepoBar,
     tx: Sender<Data>,
     prefix: String,
+    pending: Arc<Mutex<PendingIncrement>>,
+}
+
+#[derive(Debug, Default)]
+struct PendingIncrement {
+    bytes: u64,
+    last_flush: Option<Instant>,
+}
+
+const PROGRESS_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+const PROGRESS_FLUSH_BYTES: u64 = 256 * 1024;
+
+impl TxProgress {
+    fn flush_increment(&self) {
+        let increment = {
+            let Ok(mut pending) = self.pending.lock() else {
+                return;
+            };
+            if pending.bytes == 0 {
+                return;
+            }
+            pending.last_flush = Some(Instant::now());
+            std::mem::take(&mut pending.bytes)
+        };
+
+        let _ = send_event(&self.tx, Data::JobStepIncrement(JobBarIncrement {
+            job_id: self.bar.job_id.to_string(),
+            bar_id: self.bar.bar_id.to_string(),
+            increment,
+            time: proto_stamp(Timestamp::now()),
+        }));
+    }
 }
 
 impl RusticProgress for TxProgress {
@@ -26,46 +61,48 @@ impl RusticProgress for TxProgress {
     }
 
     fn set_length(&self, length: u64) {
-        self.tx
-            .send(Data::JobStepLengthSet(JobBarLengthSet {
+        let _ = send_event(&self.tx, Data::JobStepLengthSet(JobBarLengthSet {
                 job_id: self.bar.job_id.to_string(),
                 bar_id: self.bar.bar_id.to_string(),
                 time: proto_stamp(Timestamp::now()),
                 length,
-            }))
-            .unwrap();
+            }));
     }
 
     fn set_title(&self, title: &str) {
-        self.tx
-            .send(Data::JobStepTitleSet(JobBarTitleSet {
+        let _ = send_event(&self.tx, Data::JobStepTitleSet(JobBarTitleSet {
                 job_id: self.bar.job_id.to_string(),
                 bar_id: self.bar.bar_id.to_string(),
                 time: proto_stamp(Timestamp::now()),
                 title: format!("[{}] {}", &self.prefix, title),
-            }))
-            .unwrap();
+            }));
     }
 
     fn inc(&self, inc: u64) {
-        self.tx
-            .send(Data::JobStepIncrement(JobBarIncrement {
-                job_id: self.bar.job_id.to_string(),
-                bar_id: self.bar.bar_id.to_string(),
-                increment: inc,
-                time: proto_stamp(Timestamp::now()),
-            }))
-            .unwrap();
+        let should_flush = {
+            let Ok(mut pending) = self.pending.lock() else {
+                return;
+            };
+            pending.bytes = pending.bytes.saturating_add(inc);
+            pending.bytes >= PROGRESS_FLUSH_BYTES
+                || pending
+                    .last_flush
+                    .map(|t| t.elapsed() >= PROGRESS_FLUSH_INTERVAL)
+                    .unwrap_or(true)
+        };
+
+        if should_flush {
+            self.flush_increment();
+        }
     }
 
     fn finish(&self) {
-        self.tx
-            .send(Data::JobStepFinished(JobBarFinished {
-                job_id: self.bar.job_id.to_string(),
-                bar_id: self.bar.bar_id.to_string(),
-                time: proto_stamp(Timestamp::now()),
-            }))
-            .unwrap();
+        self.flush_increment();
+        let _ = send_event(&self.tx, Data::JobStepFinished(JobBarFinished {
+            job_id: self.bar.job_id.to_string(),
+            bar_id: self.bar.bar_id.to_string(),
+            time: proto_stamp(Timestamp::now()),
+        }));
     }
 }
 
@@ -83,7 +120,12 @@ impl RusticProgressBars {
             bar_id: Uuid::new_v4(),
             mode,
         };
-        TxProgress { bar, tx, prefix }
+        TxProgress {
+            bar,
+            tx,
+            prefix,
+            pending: Arc::new(Mutex::new(PendingIncrement::default())),
+        }
     }
     pub fn new(job_id: Uuid, tx: Sender<Data>) -> Self {
         Self { job_id, tx }
