@@ -431,41 +431,6 @@ pub fn repo_source(point: &VfsPoint) -> Result<RepoSource, Status> {
     })
 }
 
-/// Builds the [`OpenDALConfig`] for a data point's raw backend.
-fn point_config(point: &VfsPoint) -> OpenDALConfig {
-    OpenDALConfig::default()
-        .scheme(point.scheme.clone())
-        .options(point.config.clone().into_iter().collect::<HashMap<_, _>>())
-}
-
-/// Resolves a `repo_name` against a loaded [`VfsUser`]'s mounted points,
-/// producing the [`RepoSource`] needed to open the repository.
-///
-/// Only points mounted with `is_repo = true` qualify; the point must also
-/// carry a `repo_password`, since that's required to open/decrypt it.
-pub fn resolve_repo_point(user: &VfsUser, repo_id: &str) -> Result<RepoSource, Status> {
-    repo_source(require_repo_point_id(user, repo_id)?)
-}
-
-/// Resolves a data point by name against a loaded [`VfsUser`]'s mounted
-/// points, producing the raw [`OpenDALConfig`] for its backend.
-///
-/// Only data points (`is_repo = false`) are supported for backup/restore —
-/// repo-mounted paths are intentionally rejected.
-///
-/// Prefer [`require_data_point`] plus
-/// [`StorageSystem::get_data_operator`](crate::store::StorageSystem::get_data_operator)
-/// for new call sites — that path applies the same read-only/quota layering
-/// as the rest of the VFS, whereas this raw config bypasses both.
-#[deprecated(note = "use require_data_point plus StorageSystem::get_data_operator; this helper bypasses policy layers")]
-pub fn resolve_data_point(
-    user: &VfsUser,
-    point_name: &str,
-    _point_path: &str,
-) -> Result<OpenDALConfig, Status> {
-    Ok(point_config(require_data_point(user, point_name)?))
-}
-
 /// Resolves a VFS-relative path (as exposed to VFS clients, e.g.
 /// `/points/<name>/sub/dir`) against a loaded [`VfsUser`]'s mounted points.
 ///
@@ -536,17 +501,6 @@ pub fn resolve_data_path<'a>(
     let point = require_data_point(user, point_name)?;
     let rest = validate_relative_point_path(rest)?;
     Ok((point, PathBuf::from(rest)))
-}
-
-pub fn vfs_permission_denied(path: &str) -> Error {
-    Error::new(ErrorKind::PermissionDenied, "mount is read-only").with_context("path", path)
-}
-
-pub fn vfs_unsupported(op: &'static str) -> Error {
-    Error::new(
-        ErrorKind::Unsupported,
-        format!("MountFs does not support `{op}`."),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -717,27 +671,6 @@ mod tests {
         let src = repo_source(&p).unwrap();
         assert_eq!(src.password, "secret");
         assert_eq!(src.scheme, "s3");
-    }
-
-    #[test]
-    fn resolve_repo_point_matches_require_plus_source() {
-        let u = user(vec![repo_point("r", false, Some("secret"))]);
-        let id = u.points[0].id.to_string();
-        let src = resolve_repo_point(&u, &id).unwrap();
-        assert_eq!(src.password, "secret");
-    }
-
-    #[test]
-    fn resolve_data_point_returns_config_for_data_point() {
-        let u = user(vec![data_point("d", false)]);
-        let cfg = resolve_data_point(&u, "d", "unused");
-        assert!(cfg.is_ok());
-    }
-
-    #[test]
-    fn resolve_data_point_rejects_repo() {
-        let u = user(vec![repo_point("r", false, Some("pw"))]);
-        assert!(resolve_data_point(&u, "r", "unused").is_err());
     }
 
     #[test]

@@ -9,9 +9,12 @@ use crate::utils::fix_level;
 
 use clap::{ArgAction, Parser, ValueEnum};
 use crossbeam_channel::Sender;
-use log::{LevelFilter, Log, Metadata, Record, error, info};
+use log::{LevelFilter, Log, Metadata, Record, error, info, warn};
 use prost_types::Timestamp;
-use simplelog::{CombinedLogger, Config, SharedLogger, SimpleLogger, WriteLogger};
+use simplelog::{
+    ColorChoice, CombinedLogger, Config, SharedLogger, SimpleLogger, TermLogger, TerminalMode,
+    WriteLogger,
+};
 use std::error::Error;
 use std::fs::{OpenOptions, create_dir_all};
 use std::path::{Path, PathBuf};
@@ -176,6 +179,13 @@ impl Log for ChannelLogger {
             return;
         }
 
+        // libunftp is extremely noisy at INFO/DEBUG/TRACE. Keep its
+        // warnings and errors because authentication failures and other
+        // operational problems are useful.
+        if record.target().starts_with("libunftp") && record.level() < log::Level::Warn {
+            return;
+        }
+
         self.logger.log(record);
 
         // Forward our own crate at any level, but only warnings+ from
@@ -201,7 +211,6 @@ impl Log for ChannelLogger {
         self.logger.flush();
     }
 }
-
 fn initialize_logging(
     level: LevelFilter,
     log_file: Option<&Path>,
@@ -209,10 +218,15 @@ fn initialize_logging(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut loggers: Vec<Box<dyn SharedLogger>> = Vec::new();
 
-    // Always log to stderr.
-    loggers.push(SimpleLogger::new(level, Config::default()));
+    // Change SimpleLogger to TermLogger to get colored terminal output
+    loggers.push(TermLogger::new(
+        level,
+        Config::default(),
+        TerminalMode::Stderr,
+        ColorChoice::Auto, // Automatically checks if terminal supports color
+    ));
 
-    // Optionally log to a persistent file.
+    // Keep file logger clean without colors
     if let Some(path) = log_file {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -292,6 +306,7 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Attempt to finish all running jobs.
     info!("VFS server stopped");
 }
 

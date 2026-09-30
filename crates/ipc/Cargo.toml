@@ -15,7 +15,7 @@ thiserror = "2"
 moka = { version = "0.12", features = ["future", "sync"] }
 crossbeam-channel = "0.5.15"
 log = "0.4"
-simplelog = "0.12.2"
+simplelog = { version = "0.12.2", features = ["termcolor"] }
 argon2 = "0.5.3"
 sha2 = "0.11.0"
 tokio = { version = "1.52", features = ["full"] }
