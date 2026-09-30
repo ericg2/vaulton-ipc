@@ -541,7 +541,7 @@ mod tests {
     fn user(points: Vec<VfsPoint>) -> VfsUser {
         VfsUser {
             username: "alice".into(),
-            password: "pw".into(),
+            password_hash: "pw".into(),
             points,
         }
     }

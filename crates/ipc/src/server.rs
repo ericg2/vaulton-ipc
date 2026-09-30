@@ -234,7 +234,7 @@ impl TryFrom<ProtoVfsUser> for VfsUser {
     fn try_from(p: ProtoVfsUser) -> Result<Self, Status> {
         Ok(VfsUser {
             username: p.name,
-            password: p.password,
+            password_hash: p.password_hash,
             points: p
                 .points
                 .into_iter()

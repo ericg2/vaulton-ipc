@@ -70,6 +70,9 @@ where
     }
 }
 
+use argon2::Argon2;
+use password_hash::{PasswordHash, PasswordVerifier};
+
 #[async_trait]
 impl<S, U> Authenticator for FtpServer<S, U>
 where
@@ -87,12 +90,18 @@ where
             .await
             .map_err(|_| AuthenticationError::BadUser)?;
 
-        // Temporary authentication while developing.
-        //
-        // Replace this with your actual password verification later.
-        if user.password != *creds.password.as_ref().unwrap_or(&String::new()) {
-            return Err(AuthenticationError::BadPassword);
-        }
+        let password = creds
+            .password
+            .as_deref()
+            .ok_or(AuthenticationError::BadPassword)?;
+
+        let parsed_hash =
+            PasswordHash::new(&user.password_hash)
+                .map_err(|_| AuthenticationError::BadPassword)?;
+
+        Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .map_err(|_| AuthenticationError::BadPassword)?;
 
         Ok(Principal {
             username: username.to_string(),

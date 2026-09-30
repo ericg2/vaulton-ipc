@@ -115,7 +115,7 @@ pub struct VfsUser {
     pub username: String,
 
     /// The password to use.
-    pub password: String,
+    pub password_hash: String,
 
     /// Ordered mount points owned by this user.
     pub points: Vec<VfsPoint>,

@@ -116,7 +116,7 @@ impl DbManager {
         "#,
         )
         .bind(&user.username)
-        .bind(&user.password)
+        .bind(&user.password_hash)
         .bind(&points_json)
         .execute(&self.pool)
         .await?;
@@ -176,7 +176,7 @@ impl UserSystem for DbManager {
             "#,
             )
             .bind(&user.username)
-            .bind(&user.password)
+            .bind(&user.password_hash)
             .bind(&points_json)
             .execute(&mut *tx)
             .await?;
@@ -290,7 +290,7 @@ impl TryFrom<UserRow> for VfsUser {
 
         Ok(VfsUser {
             username: row.username,
-            password: row.password,
+            password_hash: row.password,
             points,
         })
     }
@@ -309,7 +309,7 @@ mod tests {
     fn dummy_user(name: &str) -> VfsUser {
         VfsUser {
             username: name.to_string(),
-            password: "password".to_string(),
+            password_hash: "password".to_string(),
             points: vec![VfsPoint {
                 id: Uuid::new_v4(),
                 name: "primary".to_string(),
@@ -344,7 +344,7 @@ mod tests {
 
         let loaded = mgr.get_user("alice").await.expect("Should exist");
         assert_eq!(loaded.username, "alice");
-        assert_eq!(loaded.password, "password");
+        assert_eq!(loaded.password_hash, "password");
         assert_eq!(loaded.points.len(), 1);
         assert_eq!(loaded.points[0].name, "primary");
     }
@@ -370,14 +370,14 @@ mod tests {
 
         let updated = VfsUser {
             username: "carol".to_string(),
-            password: "new-password".to_string(),
+            password_hash: "new-password".to_string(),
             points: vec![],
         };
 
         mgr.save_user(&updated).await.unwrap();
 
         let loaded = mgr.get_user("carol").await.unwrap();
-        assert_eq!(loaded.password, "new-password");
+        assert_eq!(loaded.password_hash, "new-password");
         assert!(loaded.points.is_empty());
     }
 

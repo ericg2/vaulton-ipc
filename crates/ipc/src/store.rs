@@ -706,7 +706,7 @@ mod tests {
     fn user_with(points: Vec<VfsPoint>) -> VfsUser {
         VfsUser {
             username: "alice".into(),
-            password: "pw".into(),
+            password_hash: "pw".into(),
             points,
         }
     }

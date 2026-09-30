@@ -2090,6 +2090,7 @@ dependencies = [
  "moka",
  "opendal-core",
  "opendal-vfs",
+ "password-hash",
  "prost",
  "prost-types",
  "rustic_backend",
