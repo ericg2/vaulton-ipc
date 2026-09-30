@@ -455,9 +455,7 @@ impl StorageManager {
                 .into_iter()
                 .map(|handle| match handle.join() {
                     Ok(result) => result,
-                    Err(_) => Err(VfsError::Internal(
-                        "point probe thread panicked".into(),
-                    )),
+                    Err(_) => Err(VfsError::Internal("point probe thread panicked".into())),
                 })
                 .collect::<Vec<_>>()
         });
@@ -481,11 +479,7 @@ impl StorageManager {
 
                 Err(e) => {
                     degraded = true;
-                    self.set_health(
-                        user,
-                        point,
-                        PointHealth::Failed(e.to_string()),
-                    );
+                    self.set_health(user, point, PointHealth::Failed(e.to_string()));
                 }
             }
         }

@@ -330,6 +330,30 @@ message ReloadArgs {
   string user = 1;
 }
 
+message SetLengthArgs {
+  FilePath path = 1;
+  uint64 length = 2;
+  string handle_id = 3;
+}
+
+message GetJobArgs {
+  string job_id = 1;
+}
+
+enum JobState {
+  JOB_STATE_RUNNING = 0;
+  JOB_STATE_SUCCEEDED = 1;
+  JOB_STATE_FAILED = 2;
+}
+
+message JobStatusResponse {
+  JobState state = 1;
+  uint64 done_bytes = 2;
+  uint64 total_bytes = 3;
+  string error = 4;
+}
+
+
 message Empty {}
 
 service IpcService {
@@ -342,6 +366,7 @@ service IpcService {
   rpc Poll(Empty) returns (PollResponse);
   rpc SetVfs(SetVfsArgs) returns (Empty);
   rpc GetVfs(Empty) returns (InfoResponse);
+  rpc GetJob(GetJobArgs) returns (JobStatusResponse);
   rpc ReloadVfs(ReloadArgs) returns (InfoResponse); // returns that user's points w/ fresh health
 
   rpc Vfs_ReadFile(ReadVfsArgs) returns (ReadVfsResponse);
@@ -358,6 +383,7 @@ service IpcService {
   rpc Vfs_CreateDir(FilePath) returns (Empty);
   rpc Vfs_RemoveFile(FilePath) returns (Empty);
   rpc Vfs_RemoveDir(FilePath) returns (Empty);
+  rpc Vfs_SetLength(SetLengthArgs) returns (Empty);
 
   rpc Vfs_Stat(FilePath) returns (StatResponse);
   rpc Vfs_Exists(FilePath) returns (ExistsResponse);

@@ -2,8 +2,9 @@
 
 use crossbeam_channel as chan;
 use dashmap::DashMap;
-use log::{error, warn};
-use opendal_core::{Buffer, ErrorKind as DalErrorKind, Operator};
+use futures_lite::StreamExt;
+use log::{error, info, warn};
+use opendal_core::{Buffer, ErrorKind as DalErrorKind, Metadata, Operator};
 use rustic_backend::local::LocalSource;
 use rustic_backend::opendal::OpenDALSource;
 use std::collections::{HashSet, VecDeque};
@@ -12,11 +13,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{
     Arc, Mutex as StdMutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex as TokioMutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -28,12 +29,12 @@ use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
 use crate::ipc::vfs_point::Src as ProtoSrc;
 use crate::ipc::{
     BackupArgs, CancelArgs, CheckArgs, CloseHandleArgs, Empty, ExistsResponse, FilePath,
-    ForgetArgs, GetSnapshotArgs, InfoResponse, IpcEvent, JobCancelResponse, JobFinishedEvent,
-    JobNewMessageEvent, JobStartResponse, ListVfsResponse, OpenWriteArgs, OpenWriteResponse,
-    PointSource as ProtoPoint, PollResponse, Priority, ReadVfsArgs, ReadVfsResponse, ReloadArgs,
-    RepoSource as ProtoRepo, RestoreArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse,
-    Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser,
-    WriteAtArgs,
+    ForgetArgs, GetJobArgs, GetSnapshotArgs, InfoResponse, IpcEvent, JobCancelResponse,
+    JobFinishedEvent, JobNewMessageEvent, JobStartResponse, JobState, JobStatusResponse,
+    ListVfsResponse, OpenWriteArgs, OpenWriteResponse, PointSource as ProtoPoint, PollResponse,
+    Priority, ReadVfsArgs, ReadVfsResponse, ReloadArgs, RepoSource as ProtoRepo, RestoreArgs,
+    SetLengthArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs,
+    VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteAtArgs,
 };
 use crate::progress::RusticProgressBars;
 use crate::store::{RepoSource, StorageSystem};
@@ -48,18 +49,31 @@ use rustic_core::{
     RestoreOptions, RusticError, SnapshotOptions, StringList,
 };
 
-// ── Unified Write handles ──────────────────────────────────────────────
+// ── Unified write handles ──────────────────────────────────────────────
 //
-// Backing state for `Vfs_OpenWrite`/`Vfs_WriteAt`/`Vfs_CloseWrite`.
-// Supports both random-access local writes and sequential remote streaming.
-enum WriteStateBackend {
-    Local(tokio::fs::File),
-    Remote(opendal_core::Writer),
+// Backing state for `Vfs_OpenWrite`/`Vfs_WriteAt`/`Vfs_SetLength`/`Vfs_CloseWrite`.
+//
+// Every handle is backed by a real local file:
+//   * local points: the actual destination file;
+//   * remote points: a temporary *spool* file. OpenDAL has no random-access
+//     write primitive, so the spool is seeded with the existing object (unless
+//     the handle truncates), edited like a normal file (WriteAt/SetLength work),
+//     and streamed up through an OpenDAL writer when the handle is closed.
+
+/// Extra state for handles whose real destination is a remote object.
+struct RemoteSink {
+    op: Operator,
+    path: String,
+    spool_path: PathBuf,
+    /// Only upload on close if something actually changed.
+    dirty: bool,
 }
 
 struct WriteState {
-    backend: WriteStateBackend,
+    /// Real local file, or the spool file for remote destinations.
+    file: tokio::fs::File,
     len: u64,
+    remote: Option<RemoteSink>,
 }
 
 /// Max buffered events retained for Poll; telemetry is discarded first when saturated.
@@ -70,35 +84,24 @@ const POLL_BATCH: usize = 2_000;
 const HANDLE_IDLE_TTL: Duration = Duration::from_secs(600);
 /// Largest single read served over gRPC (callers must chunk beyond this).
 const MAX_READ: u64 = 32 * 1024 * 1024;
+/// Chunk size for spool downloads/uploads and cross-backend transfers.
+const SPOOL_CHUNK: u64 = 8 * 1024 * 1024;
+/// How long finished job results stay queryable through `GetJob`.
+const FINISHED_JOB_TTL: Duration = Duration::from_secs(600);
 
 struct ActiveWriteHandle {
     last_used: StdMutex<Instant>,
     state: TokioMutex<WriteState>,
     max_bytes: Option<u64>,
     /// Total quota usage excluding the file currently owned by this handle.
+    /// A snapshot taken at open time.
     quota_base_bytes: u64,
+    #[allow(dead_code)]
     point_id: Uuid,
     username: String,
-    /// When true, every `Vfs_WriteAt` on this handle ignores the caller's
-    /// `offset` and instead writes at the current end of the file/stream.
-    ///
-    /// Always `true` for non-local (remote) backends: `Vfs_OpenWrite`
-    /// always creates a brand-new remote writer for the handle (there's no
-    /// "open an existing remote object for random-access editing"
-    /// primitive), so writes are inherently sequential regardless of
-    /// whether the backend advertises native append support — we're simply
-    /// streaming bytes into a fresh object in call order, not resuming an
-    /// existing one. `Vfs_OpenWrite` rejects `append == false` for remote
-    /// destinations rather than silently ignoring `offset`.
-    ///
-    /// For local backends this mirrors whatever the caller requested, and
-    /// combines with `overwrite` (truncate-on-open) the normal way: e.g.
-    /// `overwrite=true, append=true` truncates on open and then appends
-    /// everything written in this session from byte 0.
+    /// When true, every `Vfs_WriteAt` ignores the caller's `offset` and
+    /// writes at the current end of the file.
     append: bool,
-    /// Held for the lifetime of local write handles so quota measurement,
-    /// truncation, and writes are serialized per data point.
-    local_point_guard: Option<OwnedMutexGuard<()>>,
     expired: AtomicBool,
 }
 
@@ -125,13 +128,10 @@ fn require_path(path: &Option<FilePath>) -> Result<&FilePath, Status> {
 
 /// Checks that growing a local point's on-disk footprint by `growth` bytes
 /// stays within `max_bytes`, by walking the point's real directory tree
-/// (`utils::dir_size`) — see that function's doc comment for why a
-/// real-disk measurement is used instead of an incremental counter.
+/// (`utils::dir_size`).
 ///
-/// `growth` should already account for the file being written to (i.e. it's
-/// the *net* increase in the file's length caused by this write, not the
-/// number of bytes sent over the wire) so in-place overwrites that don't
-/// extend the file don't get penalized.
+/// `growth` should already be the *net* increase in the file's length, so
+/// in-place overwrites that don't extend the file aren't penalized.
 ///
 /// A no-op (and no disk walk) when `max_bytes` is `None` or `growth` is 0.
 async fn check_local_quota(
@@ -159,6 +159,155 @@ async fn check_local_quota(
         )));
     }
     Ok(())
+}
+
+/// Downloads the existing object into a fresh spool file (unless overwriting).
+/// Returns (file, current_len, dirty).
+async fn open_spool(
+    op: &Operator,
+    path: &str,
+    overwrite: bool,
+    spool_path: &std::path::Path,
+) -> Result<(tokio::fs::File, u64, bool), Status> {
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(spool_path)
+        .await
+        .map_err(io_status)?;
+
+    if overwrite {
+        return Ok((f, 0, true));
+    }
+
+    match op.stat(path).await {
+        Ok(meta) if meta.is_dir() => Err(Status::failed_precondition(
+            "cannot open a directory as a write target",
+        )),
+        Ok(meta) => {
+            let total = meta.content_length();
+            let mut offset = 0u64;
+            while offset < total {
+                let end = (offset + SPOOL_CHUNK).min(total);
+                let bytes = op
+                    .read_with(path)
+                    .range(offset..end)
+                    .await
+                    .map_err(map_dal)?
+                    .to_bytes();
+                if bytes.is_empty() {
+                    break;
+                }
+                f.write_all(&bytes).await.map_err(io_status)?;
+                offset += bytes.len() as u64;
+            }
+            f.flush().await.map_err(io_status)?;
+            Ok((f, offset, false))
+        }
+        // New object: make sure an (empty) object exists after close.
+        Err(e) if e.kind() == DalErrorKind::NotFound => Ok((f, 0, true)),
+        Err(e) => Err(map_dal(e)),
+    }
+}
+
+/// Flushes a handle; for remote handles uploads the spool and deletes it.
+async fn finalize_write_state(state: &mut WriteState) -> Result<(), Status> {
+    state.file.flush().await.map_err(io_status)?;
+
+    let Some(sink) = state.remote.as_ref() else {
+        return state.file.sync_all().await.map_err(io_status);
+    };
+
+    let result: Result<(), Status> = async {
+        if sink.dirty {
+            if state.len == 0 {
+                sink.op
+                    .write(&sink.path, Buffer::new())
+                    .await
+                    .map_err(map_dal)?;
+            } else {
+                state
+                    .file
+                    .seek(SeekFrom::Start(0))
+                    .await
+                    .map_err(io_status)?;
+                let mut writer = sink.op.writer(&sink.path).await.map_err(map_dal)?;
+                let mut buf = vec![0u8; SPOOL_CHUNK as usize];
+                loop {
+                    let n = state.file.read(&mut buf).await.map_err(io_status)?;
+                    if n == 0 {
+                        break;
+                    }
+                    writer.write(buf[..n].to_vec()).await.map_err(map_dal)?;
+                }
+                writer.close().await.map_err(map_dal)?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&sink.spool_path).await;
+    result
+}
+
+/// Deletes a file or directory tree and verifies it is really gone.
+/// OpenDAL treats deleting a missing path as success, so never trust Ok alone.
+async fn remove_any(op: &Operator, path: &str) -> Result<(), Status> {
+    // NotFound surfaces as an error here instead of a silent success.
+    let (meta, p) = stat_any(op, path).await?;
+
+    if meta.is_dir() {
+        op.delete_with(&p).recursive(true).await.map_err(map_dal)?;
+
+        // Fallback if the recursive delete was a no-op on this backend:
+        // delete children deepest-first, then the directory itself.
+        if op.stat(&p).await.is_ok() {
+            let mut entries = op.list_with(&p).recursive(true).await.map_err(map_dal)?;
+            entries.sort_by(|a, b| b.path().len().cmp(&a.path().len()));
+            for e in &entries {
+                if e.path() == p {
+                    continue;
+                }
+                op.delete(e.path()).await.map_err(map_dal)?;
+            }
+            op.delete(&p).await.map_err(map_dal)?;
+        }
+    } else {
+        // Plain delete: recursive(true) on a file path is what goes wrong.
+        op.delete(&p).await.map_err(map_dal)?;
+    }
+
+    match op.stat(&p).await {
+        Ok(_) => Err(Status::internal(format!(
+            "delete of '{p}' reported success but it still exists"
+        ))),
+        Err(e) if e.kind() == DalErrorKind::NotFound => Ok(()),
+        Err(e) => Err(map_dal(e)),
+    }
+}
+
+/// Stats a path that may be a file or a directory (object stores need a
+/// trailing slash for directories). Returns the metadata and the normalized path.
+async fn stat_any(op: &Operator, path: &str) -> Result<(Metadata, String), Status> {
+    match op.stat(path).await {
+        Ok(m) => {
+            let p = if m.is_dir() {
+                fix_path(path, true)
+            } else {
+                path.to_string()
+            };
+            Ok((m, p))
+        }
+        Err(e) if e.kind() == DalErrorKind::NotFound => {
+            let d = fix_path(path, true);
+            let m = op.stat(&d).await.map_err(map_dal)?;
+            Ok((m, d))
+        }
+        Err(e) => Err(map_dal(e)),
+    }
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -434,6 +583,8 @@ fn resolve_file_path(user: &VfsUser, path: &FilePath) -> Result<String, Status> 
                 "{}/{}",
                 utils::data_mount_path(&point.name),
                 path.point_path
+                    .strip_prefix("/")
+                    .unwrap_or(&path.point_path)
             ))
         }
     }
@@ -457,10 +608,7 @@ fn entry_to_node(entry: &opendal_core::Entry) -> VfsNode {
         bytes: meta.content_length(),
         ctime: mtime.clone(),
         mtime: mtime.clone(),
-        atime: Some(prost_types::Timestamp {
-            seconds: 0,
-            nanos: 0,
-        }),
+        atime: mtime,
     }
 }
 
@@ -474,6 +622,296 @@ fn chrono_to_ts(ts: opendal_core::raw::Timestamp) -> prost_types::Timestamp {
     }
 }
 
+// ── Transfer engine ───────────────────────────────────────────────────────────
+
+/// Live byte counters for a running job, readable through `GetJob`.
+#[derive(Default)]
+struct JobProgress {
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+/// Result of a finished job, retained briefly so callers can still query it.
+struct FinishedJob {
+    success: bool,
+    error: String,
+    done: u64,
+    total: u64,
+}
+
+/// Progress callback: `Some(n)` = n more bytes done, `None` = finished.
+type Report<'a> = &'a mut (dyn FnMut(Option<u64>) + Send);
+
+struct TransferPlan {
+    src_op: Operator,
+    dst_op: Operator,
+    /// Directories carry a trailing slash.
+    src_path: String,
+    dst_path: String,
+    src_is_dir: bool,
+    entries: Vec<opendal_core::Entry>,
+    total_bytes: u64,
+    copy: bool,
+    /// Same backend *and* same mount: native copy/rename are usable.
+    native: bool,
+    /// (point root, destination file path, quota) for local destinations.
+    local_quota: Option<(PathBuf, PathBuf, Option<u64>)>,
+}
+
+fn with_slash(path: &str) -> String {
+    if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    }
+}
+
+/// Streams one file through userspace in chunks.
+async fn stream_copy(
+    src_op: &Operator,
+    src: &str,
+    dst_op: &Operator,
+    dst: &str,
+    total: u64,
+    token: &CancelToken,
+    report: Report<'_>,
+) -> Result<(), String> {
+    let mut writer = dst_op
+        .writer(dst)
+        .await
+        .map_err(|e| format!("failed to create destination file '{dst}': {e}"))?;
+
+    let mut offset = 0u64;
+
+    while offset < total {
+        if token.is_cancelled() {
+            let _ = writer.close().await;
+            return Err("transfer cancelled".to_string());
+        }
+
+        let end = (offset + SPOOL_CHUNK).min(total);
+
+        let buf = match src_op.read_with(src).range(offset..end).await {
+            Ok(buf) => buf,
+            Err(e) => {
+                let _ = writer.close().await;
+                return Err(format!("failed to read '{src}' at byte {offset}: {e}"));
+            }
+        };
+
+        let n = buf.len() as u64;
+
+        if n == 0 {
+            let _ = writer.close().await;
+            return Err(format!(
+                "source '{src}' returned zero bytes before reaching its expected length"
+            ));
+        }
+
+        if let Err(e) = writer.write(buf).await {
+            let _ = writer.close().await;
+            return Err(format!("failed to write '{dst}' at byte {offset}: {e}"));
+        }
+
+        offset = offset.saturating_add(n);
+        report(Some(n));
+    }
+
+    writer
+        .close()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("failed to finalize destination file '{dst}': {e}"))
+}
+
+/// Copies one file using the native copy when possible, streaming otherwise.
+async fn copy_one(
+    plan: &TransferPlan,
+    src: &str,
+    dst: &str,
+    len: u64,
+    token: &CancelToken,
+    report: Report<'_>,
+) -> Result<(), String> {
+    if plan.native {
+        plan.src_op
+            .copy(src, dst)
+            .await
+            .map_err(|e| format!("failed to copy '{src}' to '{dst}': {e}"))?;
+        report(Some(len));
+        Ok(())
+    } else {
+        stream_copy(&plan.src_op, src, &plan.dst_op, dst, len, token, report).await
+    }
+}
+
+/// Copies the whole source (file or directory tree) to the destination.
+async fn copy_tree(
+    plan: &TransferPlan,
+    token: &CancelToken,
+    report: Report<'_>,
+) -> Result<(), String> {
+    if !plan.src_is_dir {
+        return copy_one(
+            plan,
+            &plan.src_path,
+            &plan.dst_path,
+            plan.total_bytes,
+            token,
+            report,
+        )
+        .await;
+    }
+
+    let src_prefix = with_slash(&plan.src_path);
+    let dst_prefix = with_slash(&plan.dst_path);
+
+    plan.dst_op
+        .create_dir(&plan.dst_path)
+        .await
+        .map_err(|e| format!("failed to create destination directory: {e}"))?;
+
+    for entry in &plan.entries {
+        if token.is_cancelled() {
+            return Err("transfer cancelled".to_string());
+        }
+
+        let source = entry.path().to_string();
+
+        if !source.starts_with(&src_prefix) {
+            return Err(format!("source listing returned unexpected path: {source}"));
+        }
+
+        let relative = &source[src_prefix.len()..];
+
+        // Some backends include the listed root itself.
+        if relative.is_empty() {
+            continue;
+        }
+
+        let destination = format!("{dst_prefix}{relative}");
+        let meta = entry.metadata();
+
+        // Preserve directories, including empty ones.
+        if meta.is_dir() {
+            plan.dst_op.create_dir(&destination).await.map_err(|e| {
+                format!("failed to create destination directory '{destination}': {e}")
+            })?;
+            continue;
+        }
+
+        copy_one(
+            plan,
+            &source,
+            &destination,
+            meta.content_length(),
+            token,
+            report,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// The body of a `Vfs_Transfer` job.
+async fn run_transfer(
+    plan: TransferPlan,
+    point_lock: Option<Arc<TokioMutex<()>>>,
+    job_id: Uuid,
+    tx: chan::Sender<Data>,
+    token: CancelToken,
+    progress: Arc<JobProgress>,
+) -> Result<Option<String>, String> {
+    // Re-check the destination quota under the point lock (another operation
+    // may have changed the point between job creation and execution). The lock
+    // is only held for the check so long transfers don't block new writes.
+    if let Some((root, full_path, max)) = plan.local_quota.as_ref() {
+        let _guard = match &point_lock {
+            Some(lock) => Some(lock.clone().lock_owned().await),
+            None => None,
+        };
+
+        let existing_len = tokio::fs::metadata(full_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let growth = plan.total_bytes.saturating_sub(existing_len);
+
+        check_local_quota(root, *max, growth)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let total = plan.total_bytes.max(1);
+    progress.total.store(total, Ordering::Relaxed);
+
+    let bars = RusticProgressBars::new(job_id, tx);
+    let bar = bars.progress(ProgressType::Bytes, "transfer");
+    bar.set_length(total);
+
+    let mut report: Box<dyn FnMut(Option<u64>) + Send> = {
+        let progress = Arc::clone(&progress);
+        Box::new(move |n| match n {
+            Some(n) => {
+                bar.inc(n);
+                progress.done.fetch_add(n, Ordering::Relaxed);
+            }
+            None => bar.finish(),
+        })
+    };
+
+    // MOVE on the same backend: try a native rename first.
+    if plan.native && !plan.copy {
+        match plan.src_op.rename(&plan.src_path, &plan.dst_path).await {
+            Ok(()) => {
+                report(Some(total));
+                report(None);
+                return Ok(None);
+            }
+            // Expected fallback: copy, then delete the source.
+            Err(e) if e.kind() == DalErrorKind::Unsupported => {}
+            Err(e) => return Err(format!("failed to rename source to destination: {e}")),
+        }
+    }
+
+    if let Err(e) = copy_tree(&plan, &token, &mut *report).await {
+        // The destination did not exist before this job, so we own it.
+        let _ = plan
+            .dst_op
+            .delete_with(&plan.dst_path)
+            .recursive(true)
+            .await;
+        return Err(e);
+    }
+
+    // A move never deletes the source until the destination is complete.
+    if !plan.copy {
+        if token.is_cancelled() {
+            return Err(
+                "transfer cancelled after destination copy completed; source was not deleted"
+                    .to_string(),
+            );
+        }
+
+        plan.src_op
+            .delete_with(&plan.src_path)
+            .recursive(true)
+            .await
+            .map_err(|e| {
+                format!("destination transfer completed, but source deletion failed: {e}")
+            })?;
+    }
+
+    if plan.total_bytes == 0 {
+        report(Some(1));
+    }
+    report(None);
+
+    Ok(None)
+}
+
 // ── Server state ──────────────────────────────────────────────────────────────
 
 /// A running job's cancel handle plus the username it runs on behalf of, so
@@ -482,6 +920,7 @@ fn chrono_to_ts(ts: opendal_core::raw::Timestamp) -> prost_types::Timestamp {
 struct JobHandle {
     token: CancelToken,
     user: String,
+    progress: Arc<JobProgress>,
 }
 
 struct Inner<S, U>
@@ -493,6 +932,8 @@ where
     users: Arc<U>,
     quota: QuotaState,
     jobs: DashMap<Uuid, JobHandle>,
+    /// Recently finished jobs, queryable through `GetJob`.
+    finished_jobs: Cache<Uuid, Arc<FinishedJob>>,
     events: StdMutex<VecDeque<IpcEvent>>,
     /// Open `Vfs_OpenWrite` handles, keyed by the id handed back to the
     /// caller. Entries live here for the lifetime of the handle and are
@@ -545,6 +986,10 @@ where
                 users,
                 quota,
                 jobs: DashMap::new(),
+                finished_jobs: Cache::builder()
+                    .time_to_live(FINISHED_JOB_TTL)
+                    .max_capacity(4096)
+                    .build(),
                 events: StdMutex::new(VecDeque::new()),
                 write_handles: DashMap::new(),
                 local_point_locks: DashMap::new(),
@@ -638,7 +1083,6 @@ where
                         continue;
                     };
                     warn!("closing idle write handle {id}");
-                    handle.expired.store(true, Ordering::Release);
                     tokio::spawn(Self::close_write_handle(handle));
                 }
             }
@@ -648,14 +1092,10 @@ where
     }
 
     async fn close_write_handle(handle: Arc<ActiveWriteHandle>) {
+        handle.expired.store(true, Ordering::Release);
         let mut state = handle.state.lock().await;
-        match &mut state.backend {
-            WriteStateBackend::Local(file) => {
-                let _ = file.sync_all().await;
-            }
-            WriteStateBackend::Remote(writer) => {
-                let _ = writer.close().await;
-            }
+        if let Err(e) = finalize_write_state(&mut state).await {
+            warn!("failed to finalize write handle: {e}");
         }
     }
 
@@ -833,34 +1273,59 @@ where
         self.inner.users.get_user(user).await.map_err(map_vfs)
     }
 
-    /// Registers a new job (cancel token + owning `user`) and starts the
-    /// bridge thread that drains its `crossbeam` progress/event channel
-    /// into the async-safe `events` buffer. Shared setup for `spawn_job`
-    /// and `spawn_async_job` — everything past this point differs only in
-    /// how the job body actually runs (blocking-thread rustic calls vs. a
-    /// plain tokio future).
-    fn register_job(&self, user: impl Into<String>) -> (Uuid, CancelToken, chan::Sender<Data>) {
+    /// Registers a new job (cancel token + owning `user` + progress counters)
+    /// and returns what the job body needs. Shared setup for `spawn_job` and
+    /// `spawn_async_job`.
+    fn register_job(
+        &self,
+        user: impl Into<String>,
+    ) -> (Uuid, CancelToken, chan::Sender<Data>, Arc<JobProgress>) {
         let job_id = Uuid::new_v4();
         let token = CancelToken::new();
+        let progress = Arc::new(JobProgress::default());
         self.inner.jobs.insert(
             job_id,
             JobHandle {
                 token: token.clone(),
                 user: user.into(),
+                progress: Arc::clone(&progress),
             },
         );
-        (job_id, token, self.inner.tx.clone())
+        (job_id, token, self.inner.tx.clone(), progress)
     }
 
-    /// Sends the terminal `JobMessage` (on error) and `JobFinished` events
-    /// for a job and removes it from the active-jobs map. Shared tail end
-    /// of `spawn_job` and `spawn_async_job`.
+    /// Records the job's result for `GetJob`, sends the terminal `JobMessage`
+    /// (on error) and `JobFinished` events, and removes it from the
+    /// active-jobs map. Shared tail end of `spawn_job` and `spawn_async_job`.
     fn finish_job(
         inner: &Arc<Inner<S, U>>,
         job_id: Uuid,
         tx: chan::Sender<Data>,
         result: Result<Option<String>, String>,
     ) {
+        // Publish the result *before* removing the job so `GetJob` (which
+        // checks running jobs first, then finished ones) never sees a gap.
+        let (done, total) = inner
+            .jobs
+            .get(&job_id)
+            .map(|j| {
+                (
+                    j.progress.done.load(Ordering::Relaxed),
+                    j.progress.total.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0));
+
+        inner.finished_jobs.insert(
+            job_id,
+            Arc::new(FinishedJob {
+                success: result.is_ok(),
+                error: result.as_ref().err().cloned().unwrap_or_default(),
+                done,
+                total,
+            }),
+        );
+
         if let Err(ref e) = result {
             error!("job {job_id} failed: {e}");
             let _ = send_event(
@@ -904,7 +1369,7 @@ where
             + Send
             + 'static,
     {
-        let (job_id, token, tx) = self.register_job(user);
+        let (job_id, token, tx, _progress) = self.register_job(user);
         let inner = Arc::clone(&self.inner);
 
         tokio::task::spawn_blocking(move || {
@@ -923,22 +1388,20 @@ where
 
     /// Like [`spawn_job`](Self::spawn_job), but for jobs that are plain
     /// `async` tokio work rather than blocking rustic calls — e.g.
-    /// `Vfs_Transfer`'s OpenDAL copy/streaming. Runs `f` as a future on the
-    /// tokio runtime instead of inside `spawn_blocking`, and is generic
-    /// over any displayable error type so callers don't have to funnel
-    /// non-rustic errors through `RusticError` just to reuse this plumbing.
+    /// `Vfs_Transfer`. The closure also receives the job's [`JobProgress`]
+    /// so it can publish byte counters for `GetJob`.
     fn spawn_async_job<F, Fut, E>(&self, user: impl Into<String>, f: F) -> String
     where
-        F: FnOnce(Uuid, chan::Sender<Data>, CancelToken) -> Fut + Send + 'static,
+        F: FnOnce(Uuid, chan::Sender<Data>, CancelToken, Arc<JobProgress>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<Option<String>, E>> + Send + 'static,
         E: std::fmt::Display + std::marker::Send + 'static,
     {
-        let (job_id, token, tx) = self.register_job(user);
+        let (job_id, token, tx, progress) = self.register_job(user);
         let inner = Arc::clone(&self.inner);
 
         tokio::spawn(async move {
             // Run in its own task so a panic is observed instead of leaking the job.
-            let result = match tokio::spawn(f(job_id, tx.clone(), token)).await {
+            let result = match tokio::spawn(f(job_id, tx.clone(), token, progress)).await {
                 Ok(r) => r.map_err(|e| e.to_string()),
                 Err(e) => Err(format!("job panicked: {e}")),
             };
@@ -1240,6 +1703,49 @@ where
         }
     }
 
+    // ── GetJob ────────────────────────────────────────────────────────────────
+
+    /// Returns the live state of a running job, or the recorded result of a
+    /// recently finished one. Lets synchronous callers (SMB) wait on jobs
+    /// without consuming the shared `Poll` event stream.
+    async fn get_job(
+        &self,
+        req: Request<GetJobArgs>,
+    ) -> Result<Response<JobStatusResponse>, Status> {
+        let args = req.into_inner();
+        let uuid = Uuid::parse_str(&args.job_id)
+            .map_err(|e| Status::invalid_argument(format!("bad job_id: {e}")))?;
+
+        // Running jobs first; `finish_job` records the result before removing
+        // the job, so one of the two lookups always hits.
+        if let Some(job) = self.inner.jobs.get(&uuid) {
+            return Ok(Response::new(JobStatusResponse {
+                state: JobState::Running as i32,
+                done_bytes: job.progress.done.load(Ordering::Relaxed),
+                total_bytes: job.progress.total.load(Ordering::Relaxed),
+                error: String::new(),
+            }));
+        }
+
+        if let Some(finished) = self.inner.finished_jobs.get(&uuid) {
+            return Ok(Response::new(JobStatusResponse {
+                state: if finished.success {
+                    JobState::Succeeded
+                } else {
+                    JobState::Failed
+                } as i32,
+                done_bytes: finished.done,
+                total_bytes: finished.total,
+                error: finished.error.clone(),
+            }));
+        }
+
+        Err(Status::not_found(format!(
+            "job '{}' not found (unknown or result expired)",
+            args.job_id
+        )))
+    }
+
     async fn poll(&self, _: Request<Empty>) -> Result<Response<PollResponse>, Status> {
         let mut events = self
             .inner
@@ -1389,10 +1895,12 @@ where
                 .offset
                 .checked_add(args.length)
                 .ok_or_else(|| Status::invalid_argument("read range overflow"))?;
-            op.read_with(&path)
-                .range(args.offset..end)
-                .await
-                .map_err(map_dal)?
+            match op.read_with(&path).range(args.offset..end).await {
+                Ok(b) => b,
+                // Reading at/after EOF yields no data rather than an error.
+                Err(e) if e.kind() == DalErrorKind::RangeNotSatisfied => Buffer::new(),
+                Err(e) => return Err(map_dal(e)),
+            }
         };
 
         Ok(Response::new(ReadVfsResponse {
@@ -1400,7 +1908,7 @@ where
         }))
     }
 
-    // ── Write handles (streaming + random access) ─────────────────
+    // ── Write handles (random access; remote points are spooled) ──────────
 
     async fn vfs_touch_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
@@ -1423,19 +1931,17 @@ where
 
         let handle_id = Uuid::new_v4();
 
-        let local_point_guard = if utils::is_local_scheme(&point.scheme) {
+        let handle = if utils::is_local_scheme(&point.scheme) {
+            // Only held while opening; NOT for the life of the handle, or a
+            // second open / set_length / transfer on this point would deadlock.
             let lock = self
                 .inner
                 .local_point_locks
                 .entry(point.id)
                 .or_insert_with(|| Arc::new(TokioMutex::new(())))
                 .clone();
-            Some(lock.lock_owned().await)
-        } else {
-            None
-        };
+            let _guard = lock.lock_owned().await;
 
-        if utils::is_local_scheme(&point.scheme) {
             let root = PathBuf::from(utils::local_source_path(point)?);
             let full_path = utils::safe_join(&root, &rest.to_string_lossy())?;
 
@@ -1453,17 +1959,20 @@ where
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
                 Err(e) => return Err(io_status(e)),
             };
-
-            let root_for_scan = root.clone();
-            let total_used = tokio::task::spawn_blocking(move || utils::dir_size(&root_for_scan))
-                .await
-                .map_err(|e| Status::internal(format!("quota check panicked: {e}")))?
-                .map_err(|e| Status::internal(format!("failed to measure quota usage: {e}")))?;
-            let quota_base_bytes = total_used.saturating_sub(existing_len);
             let initial_len = if args.overwrite { 0 } else { existing_len };
 
-            if let Some(max) = point.max_bytes {
-                if quota_base_bytes
+            // Only walk the tree when a quota actually exists.
+            let quota_base_bytes = if let Some(max) = point.max_bytes {
+                let root_for_scan = root.clone();
+                let total_used =
+                    tokio::task::spawn_blocking(move || utils::dir_size(&root_for_scan))
+                        .await
+                        .map_err(|e| Status::internal(format!("quota check panicked: {e}")))?
+                        .map_err(|e| {
+                            Status::internal(format!("failed to measure quota usage: {e}"))
+                        })?;
+                let base = total_used.saturating_sub(existing_len);
+                if base
                     .checked_add(initial_len)
                     .ok_or_else(|| Status::resource_exhausted("quota size overflow"))?
                     > max
@@ -1473,9 +1982,12 @@ where
                         point.name
                     )));
                 }
-            }
+                base
+            } else {
+                0
+            };
 
-            let file = tokio::fs::OpenOptions::new()
+            let f = tokio::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .read(true)
@@ -1484,63 +1996,61 @@ where
                 .map_err(io_status)?;
 
             if args.overwrite {
-                file.set_len(0).await.map_err(io_status)?;
+                f.set_len(0).await.map_err(io_status)?;
             }
 
-            self.inner.write_handles.insert(
-                handle_id,
-                Arc::new(ActiveWriteHandle {
-                    last_used: StdMutex::new(Instant::now()),
-                    state: TokioMutex::new(WriteState {
-                        backend: WriteStateBackend::Local(file),
-                        len: initial_len,
-                    }),
-                    max_bytes: point.max_bytes,
-                    quota_base_bytes,
-                    point_id: point.id,
-                    username: user.username.clone(),
-                    append: args.append,
-                    local_point_guard,
-                    expired: AtomicBool::new(false),
+            Arc::new(ActiveWriteHandle {
+                last_used: StdMutex::new(Instant::now()),
+                state: TokioMutex::new(WriteState {
+                    file: f,
+                    len: initial_len,
+                    remote: None,
                 }),
-            );
+                max_bytes: point.max_bytes,
+                quota_base_bytes,
+                point_id: point.id,
+                username: user.username.clone(),
+                append: args.append,
+                expired: AtomicBool::new(false),
+            })
         } else {
-            // Remote destinations: `Vfs_OpenWrite` always opens a brand-new
-            // writer (opendal has no "open an existing object for
-            // random-access editing" primitive), so `Vfs_WriteAt` on this
-            // handle is inherently sequential regardless of the backend's
-            // native append capability — we're streaming into a fresh
-            // object, not resuming one. Require the caller to acknowledge
-            // this by setting `append = true` rather than silently ignoring
-            // `offset` later; `overwrite` is implied by opening a fresh
-            // writer and doesn't need separate handling here.
-            if !args.append {
-                return Err(Status::invalid_argument(
-                    "non-local write destinations only support sequential (append) writes; set append=true",
-                ));
-            }
-
+            // Remote: spool to a local temp file, upload on close.
             let (op, file_path) = self.get_operator(file, false).await?;
-            let writer = op.writer(&file_path).await.map_err(map_dal)?;
+            let spool_path = std::env::temp_dir().join(format!("vfs-spool-{handle_id}"));
 
-            self.inner.write_handles.insert(
-                handle_id,
-                Arc::new(ActiveWriteHandle {
-                    last_used: StdMutex::new(Instant::now()),
-                    state: TokioMutex::new(WriteState {
-                        backend: WriteStateBackend::Remote(writer),
-                        len: 0,
+            let (f, len, dirty) =
+                match open_spool(&op, &file_path, args.overwrite, &spool_path).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&spool_path).await;
+                        return Err(e);
+                    }
+                };
+
+            Arc::new(ActiveWriteHandle {
+                last_used: StdMutex::new(Instant::now()),
+                state: TokioMutex::new(WriteState {
+                    file: f,
+                    len,
+                    remote: Some(RemoteSink {
+                        op,
+                        path: file_path,
+                        spool_path,
+                        dirty,
                     }),
-                    max_bytes: None, // Remote quotas are handled downstream via OpenDAL quota layer
-                    quota_base_bytes: 0,
-                    point_id: point.id,
-                    username: user.username.clone(),
-                    append: true,
-                    local_point_guard: None,
-                    expired: AtomicBool::new(false),
                 }),
-            );
-        }
+                // Per-file guard so a runaway write can't fill the temp disk;
+                // point-wide remote quota is still enforced by the OpenDAL layer.
+                max_bytes: point.max_bytes,
+                quota_base_bytes: 0,
+                point_id: point.id,
+                username: user.username.clone(),
+                append: args.append,
+                expired: AtomicBool::new(false),
+            })
+        };
+
+        self.inner.write_handles.insert(handle_id, handle);
 
         Ok(Response::new(OpenWriteResponse {
             handle_id: handle_id.to_string(),
@@ -1566,61 +2076,49 @@ where
         }
 
         let mut state = handle.state.lock().await;
+        if handle.expired.load(Ordering::Acquire) {
+            return Err(Status::not_found("write handle closed"));
+        }
+        let WriteState { file, len, remote } = &mut *state;
 
-        let WriteState { backend, len } = &mut *state;
+        // In append mode the caller's offset is ignored entirely — always
+        // write at the current end of the file.
+        let write_offset = if handle.append {
+            file.seek(SeekFrom::End(0)).await.map_err(io_status)?
+        } else {
+            args.offset
+        };
 
-        match backend {
-            WriteStateBackend::Local(file) => {
-                // In append mode the caller's offset is ignored entirely —
-                // always write at the current end of the file.
-                let write_offset = if handle.append {
-                    file.seek(SeekFrom::End(0)).await.map_err(io_status)?
-                } else {
-                    args.offset
-                };
+        let new_len = (*len).max(
+            write_offset
+                .checked_add(args.data.len() as u64)
+                .ok_or_else(|| Status::invalid_argument("offset overflow"))?,
+        );
 
-                let new_len = (*len).max(
-                    write_offset
-                        .checked_add(args.data.len() as u64)
-                        .ok_or_else(|| Status::invalid_argument("offset overflow"))?,
-                );
-
-                if let Some(max) = handle.max_bytes {
-                    let projected = handle
-                        .quota_base_bytes
-                        .checked_add(new_len)
-                        .ok_or_else(|| Status::resource_exhausted("quota size overflow"))?;
-                    if projected > max {
-                        return Err(Status::resource_exhausted(format!(
-                            "write would exceed point quota ({projected} > {max} bytes)"
-                        )));
-                    }
-                }
-
-                if !handle.append {
-                    file.seek(SeekFrom::Start(write_offset))
-                        .await
-                        .map_err(io_status)?;
-                }
-
-                file.write_all(&args.data).await.map_err(io_status)?;
-
-                *len = new_len;
+        if let Some(max) = handle.max_bytes {
+            let projected = handle
+                .quota_base_bytes
+                .checked_add(new_len)
+                .ok_or_else(|| Status::resource_exhausted("quota size overflow"))?;
+            if projected > max {
+                return Err(Status::resource_exhausted(format!(
+                    "write would exceed point quota ({projected} > {max} bytes)"
+                )));
             }
+        }
 
-            WriteStateBackend::Remote(writer) => {
-                if args.offset != *len {
-                    return Err(Status::invalid_argument(format!(
-                        "remote writes must be sequential: expected offset {}, got {}",
-                        *len, args.offset
-                    )));
-                }
+        if !handle.append {
+            file.seek(SeekFrom::Start(write_offset))
+                .await
+                .map_err(io_status)?;
+        }
+        file.write_all(&args.data).await.map_err(io_status)?;
+        // tokio's File buffers; flush so stat/read on other fds see the data.
+        file.flush().await.map_err(io_status)?;
 
-                writer.write(args.data.clone()).await.map_err(map_dal)?;
-                *len = len
-                    .checked_add(args.data.len() as u64)
-                    .ok_or_else(|| Status::invalid_argument("write length overflow"))?;
-            }
+        *len = new_len;
+        if let Some(r) = remote {
+            r.dirty = true;
         }
 
         Ok(Response::new(Empty {}))
@@ -1633,26 +2131,16 @@ where
         let args = request.into_inner();
         let handle_id = parse_handle_id(&args.handle_id)?;
 
-        let handle = self
+        let (_, handle) = self
             .inner
             .write_handles
-            .get(&handle_id)
-            .map(|h| Arc::clone(&*h))
+            .remove(&handle_id)
             .ok_or_else(|| Status::not_found("unknown or already-closed write handle"))?;
 
+        handle.expired.store(true, Ordering::Release);
         let mut state = handle.state.lock().await;
-        match &mut state.backend {
-            WriteStateBackend::Local(file) => {
-                file.flush().await.map_err(io_status)?;
-                file.sync_all().await.map_err(io_status)?;
-            }
+        finalize_write_state(&mut state).await?;
 
-            WriteStateBackend::Remote(writer) => {
-                writer.close().await.map_err(map_dal)?;
-            }
-        }
-
-        self.inner.write_handles.remove(&handle_id);
         Ok(Response::new(Empty {}))
     }
 
@@ -1672,24 +2160,121 @@ where
     async fn vfs_create_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
         let (op, path) = self.get_operator(&args, true).await?;
+        info!("Attempting to create {}", &path);
         op.create_dir(&path).await.map_err(map_dal)?;
         Ok(Response::new(Empty {}))
     }
-
     async fn vfs_remove_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
         let (op, path) = self.get_operator(&args, false).await?;
-        op.delete_with(&path).await.map_err(map_dal)?;
+        info!("Attempting to remove {}", &path);
+        remove_any(&op, &path).await?;
         Ok(Response::new(Empty {}))
     }
 
     async fn vfs_remove_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
-        let (op, path) = self.get_operator(&args, true).await?;
-        op.delete_with(&path)
-            .recursive(true)
+        let (op, path) = self.get_operator(&args, false).await?;
+        info!("Attempting to remove {}", &path);
+        remove_any(&op, &path).await?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn vfs_set_length(
+        &self,
+        request: Request<SetLengthArgs>,
+    ) -> Result<Response<Empty>, Status> {
+        let args = request.into_inner();
+
+        // Preferred path: resize an open write handle. Works for local files
+        // and for remote spool files alike, and never contends on the point
+        // lock (the handle already owns its file).
+        if !args.handle_id.is_empty() {
+            let handle_id = parse_handle_id(&args.handle_id)?;
+            let handle = self
+                .inner
+                .write_handles
+                .get(&handle_id)
+                .map(|h| Arc::clone(&*h))
+                .ok_or_else(|| Status::not_found("unknown or already-closed write handle"))?;
+
+            let mut state = handle.state.lock().await;
+            if handle.expired.load(Ordering::Acquire) {
+                return Err(Status::not_found("write handle closed"));
+            }
+            if let Some(max) = handle.max_bytes {
+                if handle.quota_base_bytes.saturating_add(args.length) > max {
+                    return Err(Status::resource_exhausted(
+                        "set_length would exceed point quota",
+                    ));
+                }
+            }
+            state.file.set_len(args.length).await.map_err(io_status)?;
+            state.len = args.length;
+            if let Some(r) = state.remote.as_mut() {
+                r.dirty = true;
+            }
+            if let Ok(mut t) = handle.last_used.lock() {
+                *t = Instant::now();
+            }
+            return Ok(Response::new(Empty {}));
+        }
+
+        // Fallback: path-based resize, local writable points only.
+        let file = require_path(&args.path)?;
+        let user = self.get_user(&file.user).await?;
+        let vfs_path = resolve_file_path(&user, file)?;
+
+        let (point, rest) = utils::resolve_data_path(&user, &vfs_path)?;
+        utils::require_writable(point)?;
+
+        // OpenDAL does not provide a portable random-access truncate/resize
+        // primitive, so without a handle only local points are supported.
+        if !utils::is_local_scheme(&point.scheme) {
+            return Err(Status::unimplemented(
+                "path-based set_length is only supported for local writable points; \
+                 pass the handle_id of an open write handle for remote points",
+            ));
+        }
+
+        let lock = self
+            .inner
+            .local_point_locks
+            .entry(point.id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone();
+
+        // Serialize with Vfs_OpenWrite and other local operations on this point.
+        let _point_guard = lock.lock_owned().await;
+
+        let root = PathBuf::from(utils::local_source_path(point)?);
+        let full_path = utils::safe_join(&root, &rest.to_string_lossy())?;
+        let metadata = tokio::fs::metadata(&full_path).await.map_err(io_status)?;
+
+        if !metadata.is_file() {
+            return Err(Status::failed_precondition(
+                "cannot set the length of a directory",
+            ));
+        }
+
+        let old_len = metadata.len();
+        let new_len = args.length;
+
+        // Only growing the file consumes additional quota. Shrinking it frees
+        // space, so it never needs a quota reservation.
+        if new_len > old_len {
+            let growth = new_len - old_len;
+            check_local_quota(&root, point.max_bytes, growth).await?;
+        }
+
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&full_path)
             .await
-            .map_err(map_dal)?;
+            .map_err(io_status)?;
+
+        file.set_len(new_len).await.map_err(io_status)?;
+
         Ok(Response::new(Empty {}))
     }
 
@@ -1725,9 +2310,9 @@ where
                 name,
                 is_dir: meta.is_dir(),
                 bytes: meta.content_length(),
-                ctime: None,
-                mtime,
-                atime: None,
+                ctime: mtime.clone(),
+                mtime: mtime.clone(),
+                atime: mtime,
             }),
         }))
     }
@@ -1758,16 +2343,16 @@ where
         Ok(Response::new(ExistsResponse { exists }))
     }
 
-    /// Transfers (copies or moves) a single file between two VFS paths as a
-    /// background job, so callers get progress and can poll/cancel it the
-    /// same way they do for `Backup`/`Restore`.
+    /// Transfers (copies or moves) a file or directory between two VFS paths
+    /// as a background job. Progress is readable through `GetJob`.
     ///
-    /// Same-backend transfers use opendal's native `copy`/`rename` and
-    /// report a single before/after tick — there's no meaningful partial
-    /// progress for an atomic backend-side operation. Cross-backend
-    /// transfers stream the file in chunks and report real byte progress
-    /// per chunk, which also keeps a cancellation request from having to
-    /// wait for the whole file to move first.
+    /// Same-mount transfers use native backend operations where possible
+    /// (native `copy`, native `rename` with a copy+delete fallback).
+    /// Everything else is streamed through userspace in chunks so progress
+    /// and cancellation remain meaningful.
+    ///
+    /// A move never deletes the source until the destination has been fully
+    /// transferred successfully.
     async fn vfs_transfer(
         &self,
         request: Request<TransferArgs>,
@@ -1789,245 +2374,136 @@ where
             }
         }
 
+        let copy = args.copy;
+        let username = old_file.user.clone();
+
+        let src_user = self.get_user(&old_file.user).await?;
         let dst_user = self.get_user(&new_file.user).await?;
+
+        let src_path_for_point = resolve_file_path(&src_user, old_file)?;
         let dst_path_for_point = resolve_file_path(&dst_user, new_file)?;
-        let (dst_point, _) = utils::resolve_data_path(&dst_user, &dst_path_for_point)?;
+
+        let (src_point, _) = utils::resolve_data_path(&src_user, &src_path_for_point)?;
+        let (dst_point, dst_rest) = utils::resolve_data_path(&dst_user, &dst_path_for_point)?;
+
         utils::require_writable(dst_point)?;
 
         let (src_op, src_path) = self.get_operator(old_file, false).await?;
         let (dst_op, dst_path) = self.get_operator(new_file, false).await?;
 
-        let src_meta = src_op.stat(&src_path).await.map_err(map_dal)?;
-        if src_meta.is_dir() {
-            return Err(Status::unimplemented(
-                "directory transfers are not supported",
-            ));
+        // Inspect the source (file or directory).
+        let (src_meta, src_path) = stat_any(&src_op, &src_path).await?;
+        let src_is_dir = src_meta.is_dir();
+        let dst_path = if src_is_dir {
+            fix_path(&dst_path, true)
+        } else {
+            dst_path
+        };
+
+        // The destination must not already exist. This keeps cross-backend
+        // transfers safe and gives a simple cleanup guarantee: if the job
+        // creates the destination, it owns it and may remove it on failure.
+        match stat_any(&dst_op, &dst_path).await {
+            Ok((meta, _)) => {
+                if src_is_dir && !meta.is_dir() {
+                    return Err(Status::failed_precondition(
+                        "destination exists and is not a directory",
+                    ));
+                }
+                if !src_is_dir && meta.is_dir() {
+                    return Err(Status::failed_precondition(
+                        "destination exists and is a directory",
+                    ));
+                }
+                return Err(Status::already_exists("destination already exists"));
+            }
+            Err(e) if e.code() == tonic::Code::NotFound => {}
+            Err(e) => return Err(e),
         }
 
-        // Two operators are "the same backend" if their scheme, root, and
-        // backend name all match. This is the closest thing OpenDAL exposes
-        // to identity/equality on `Operator` (which doesn't impl PartialEq).
+        // OpenDAL Operator does not implement PartialEq, so compare the
+        // properties that identify the underlying operator.
         let src_info = src_op.info();
         let dst_info = dst_op.info();
+
         let same_backend = src_info.scheme() == dst_info.scheme()
             && src_info.root() == dst_info.root()
             && src_info.name() == dst_info.name();
 
-        let copy = args.copy;
-        let username = old_file.user.clone();
-
-        let src_user = self.get_user(&old_file.user).await?;
-        let src_path_for_point = resolve_file_path(&src_user, old_file)?;
-        let src_root = src_path_for_point.trim_start_matches('/').split('/').next();
-        let src_point_name = src_path_for_point
-            .trim_start_matches('/')
-            .split('/')
-            .nth(1)
-            .unwrap_or_default();
-        let src_point = match src_root {
-            Some(root) if root == utils::POINTS_ROOT => {
-                utils::require_data_point(&src_user, src_point_name)?
-            }
-            Some(root) if root == utils::REPOS_ROOT => {
-                utils::require_repo_point(&src_user, src_point_name)?
-            }
-            _ => return Err(Status::invalid_argument("invalid source mount")),
-        };
         let same_mount = src_point.id == dst_point.id;
+
         if same_mount && src_path == dst_path {
             return Err(Status::invalid_argument(
                 "source and destination are identical",
             ));
         }
 
-        if same_backend && same_mount {
-            let inner = Arc::clone(&self.inner);
-            let dst_local_quota = if copy && utils::is_local_scheme(&dst_point.scheme) {
-                let root = PathBuf::from(utils::local_source_path(dst_point)?);
-                let (_, rest) = utils::resolve_data_path(&dst_user, &dst_path)?;
-                let full_path = utils::safe_join(&root, &rest.to_string_lossy())?;
-                Some((root, full_path, dst_point.max_bytes))
-            } else {
-                None
-            };
-            let dst_point_id = dst_point.id;
-            let dst_is_local = utils::is_local_scheme(&dst_point.scheme);
-            // Same backend: let opendal do an intra-backend copy/rename,
-            // which is typically far cheaper than a read+write round trip
-            // (and atomic where the backend supports it). Nothing here can
-            // report partial progress, so the bar just brackets the call.
-            let job_id = self.spawn_async_job::<_, _, String>(
-                username,
-                move |job_id, tx, _token| async move {
-                    let _local_guard = if dst_is_local {
-                        let lock = inner
-                            .local_point_locks
-                            .entry(dst_point_id)
-                            .or_insert_with(|| Arc::new(TokioMutex::new(())))
-                            .clone();
-                        Some(lock.lock_owned().await)
-                    } else {
-                        None
-                    };
-                    if let Some((root, full_path, max)) = dst_local_quota.as_ref() {
-                        let existing_len = tokio::fs::metadata(full_path)
-                            .await
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        let total = src_op
-                            .stat(&src_path)
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .content_length();
-                        let growth = total.saturating_sub(existing_len);
-                        check_local_quota(root, *max, growth)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                    }
-
-                    let bars = RusticProgressBars::new(job_id, tx);
-                    let bar = bars.progress(ProgressType::Bytes, "transfer");
-                    bar.set_length(1);
-
-                    if copy {
-                        src_op
-                            .copy(&src_path, &dst_path)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                    } else {
-                        src_op
-                            .rename(&src_path, &dst_path)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                    }
-
-                    bar.inc(1);
-                    bar.finish();
-                    Ok(None)
-                },
-            );
-
-            return Ok(Response::new(JobStartResponse { job_id }));
-        }
-
-        // Different backends: no cross-backend copy/rename primitive
-        // exists, so stream the bytes through manually, in chunks so
-        // progress and cancellation are meaningful mid-transfer.
-        //
-        // `stat` and the quota check both happen up front, before the job
-        // is even spawned — same as the read-only checks `backup`/`restore`
-        // do — so a doomed transfer is rejected immediately instead of
-        // being accepted and failing once it's already running.
-        let meta = src_op.stat(&src_path).await.map_err(map_dal)?;
-        let total = meta.content_length();
-
-        let destination_exists = match dst_op.stat(&dst_path).await {
-            Ok(meta) if !meta.is_dir() => true,
-            Ok(_) => return Err(Status::failed_precondition("destination is a directory")),
-            Err(e) if e.kind() == DalErrorKind::NotFound => false,
-            Err(e) => return Err(map_dal(e)),
-        };
-
-        // Cross-backend streaming is not atomic. Refuse to overwrite an
-        // existing destination so a failed transfer can always clean up its
-        // partial output without destroying a pre-existing file.
-        if destination_exists {
-            return Err(Status::already_exists(
-                "cross-backend transfers require a new destination",
+        if src_is_dir && same_mount && dst_path.starts_with(&src_path) {
+            return Err(Status::invalid_argument(
+                "cannot transfer a directory into itself",
             ));
         }
 
-        let dst_local_quota = if utils::is_local_scheme(&dst_point.scheme) {
-            let root = PathBuf::from(utils::local_source_path(dst_point)?);
-            let (_, dst_rest) = utils::resolve_data_path(&dst_user, &dst_path)?;
-            let full_path = utils::safe_join(&root, &dst_rest.to_string_lossy())?;
-            Some((root, full_path, dst_point.max_bytes))
+        // Enumerate the source tree if this is a directory.
+        let entries = if src_is_dir {
+            src_op
+                .list_with(&src_path)
+                .recursive(true)
+                .await
+                .map_err(map_dal)?
         } else {
-            None
+            Vec::new()
         };
 
-        let inner = Arc::clone(&self.inner);
-        let dst_point_id = dst_point.id;
-        let dst_is_local = utils::is_local_scheme(&dst_point.scheme);
-        let job_id = self.spawn_async_job(username, move |job_id, tx, token| async move {
-            let _local_guard = if dst_is_local {
-                let lock = inner
-                    .local_point_locks
-                    .entry(dst_point_id)
-                    .or_insert_with(|| Arc::new(TokioMutex::new(())))
-                    .clone();
-                Some(lock.lock_owned().await)
-            } else {
-                None
-            };
-            if let Some((root, full_path, max)) = dst_local_quota.as_ref() {
-                let existing_len = tokio::fs::metadata(full_path)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                let growth = total.saturating_sub(existing_len);
-                check_local_quota(root, *max, growth)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
+        // Total bytes that will actually be copied. Directories themselves
+        // have no useful byte progress, so progress is the sum of file sizes.
+        let total_bytes = if src_is_dir {
+            entries
+                .iter()
+                .map(|e| e.metadata())
+                .filter(|m| !m.is_dir())
+                .fold(0u64, |acc, m| acc.saturating_add(m.content_length()))
+        } else {
+            src_meta.content_length()
+        };
 
-            let bars = RusticProgressBars::new(job_id, tx);
-            let bar = bars.progress(ProgressType::Bytes, "transfer");
-            bar.set_length(total.max(1));
+        // Local destination quota information (re-checked inside the job).
+        // A move within the same point doesn't change the point's total size,
+        // so skip the check there. Copies, and moves between points, add bytes.
+        let needs_quota_check = copy || !same_mount;
 
-            // 8 MiB chunks: big enough to keep per-chunk overhead low,
-            // small enough that progress updates stay meaningfully
-            // granular and a cancellation is noticed promptly rather than
-            // only between whole-file reads.
-            const CHUNK: u64 = 8 * 1024 * 1024;
+        let (local_quota, point_lock) = if utils::is_local_scheme(&dst_point.scheme) {
+            let root = PathBuf::from(utils::local_source_path(dst_point)?);
+            let full_path = utils::safe_join(&root, &dst_rest.to_string_lossy())?;
+            let lock = self
+                .inner
+                .local_point_locks
+                .entry(dst_point.id)
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone();
+            (
+                needs_quota_check.then_some((root, full_path, dst_point.max_bytes)),
+                Some(lock),
+            )
+        } else {
+            (None, None)
+        };
 
-            let mut writer = dst_op.writer(&dst_path).await.map_err(|e| e.to_string())?;
-            let mut offset = 0u64;
+        let plan = TransferPlan {
+            src_op,
+            dst_op,
+            src_path,
+            dst_path,
+            src_is_dir,
+            entries,
+            total_bytes,
+            copy,
+            native: same_backend && same_mount,
+            local_quota,
+        };
 
-            let transfer_result: Result<(), String> = async {
-                while offset < total {
-                    if token.is_cancelled() {
-                        return Err("transfer cancelled".to_string());
-                    }
-
-                    let end = (offset + CHUNK).min(total);
-                    let buf = src_op
-                        .read_with(&src_path)
-                        .range(offset..end)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let n = buf.len() as u64;
-
-                    writer.write(buf).await.map_err(|e| e.to_string())?;
-                    bar.inc(n);
-                    offset = end;
-                }
-                Ok(())
-            }
-            .await;
-
-            if let Err(e) = transfer_result {
-                // The destination was verified absent before the job started,
-                // so cleanup cannot destroy a pre-existing file.
-                let _ = dst_op.delete(&dst_path).await;
-                return Err(e);
-            }
-
-            if let Err(e) = writer.close().await {
-                let _ = dst_op.delete(&dst_path).await;
-                return Err(e.to_string());
-            }
-
-            if !copy {
-                if let Err(e) = src_op.delete(&src_path).await {
-                    return Err(format!(
-                        "destination transfer completed, but source deletion failed: {e}"
-                    ));
-                }
-            }
-
-            bar.finish();
-            Ok(None)
+        let job_id = self.spawn_async_job(username, move |job_id, tx, token, progress| {
+            run_transfer(plan, point_lock, job_id, tx, token, progress)
         });
 
         Ok(Response::new(JobStartResponse { job_id }))
