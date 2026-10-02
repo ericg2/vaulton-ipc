@@ -52,6 +52,9 @@ pub enum VfsError {
     #[error("point '{name}' failed to load: {reason}")]
     PointFailed { name: String, reason: String },
 
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -105,6 +108,36 @@ pub struct VfsPoint {
     /// Decryption password for the rustic repository.
     /// Required (and only consulted) when `is_repo` is `true`.
     pub repo_password: Option<String>,
+}
+
+/// Checks the point-ID invariants that every other layer relies on.
+///
+/// A point ID is the *only* thing that identifies a point in indexed paths,
+/// quota keys, health records and operator caches. Data points and repo points
+/// share one ID space, so the same ID must never appear twice anywhere in the
+/// configuration (not within a user, not across users, and not across the
+/// data/repo kinds). Nil IDs are rejected as well.
+pub fn validate_point_ids<'a>(users: impl IntoIterator<Item = &'a VfsUser>) -> VfsResult<()> {
+    let mut seen: std::collections::HashMap<Uuid, (&str, &str)> = std::collections::HashMap::new();
+    for user in users {
+        for point in &user.points {
+            if point.id.is_nil() {
+                return Err(VfsError::InvalidConfig(format!(
+                    "point '{}' of user '{}' has a nil ID",
+                    point.name, user.username
+                )));
+            }
+            if let Some((other_user, other_name)) =
+                seen.insert(point.id, (user.username.as_str(), point.name.as_str()))
+            {
+                return Err(VfsError::InvalidConfig(format!(
+                    "point ID {} is used by both '{}/{}' and '{}/{}'",
+                    point.id, other_user, other_name, user.username, point.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A user identity and its associated virtual filesystem mount points.

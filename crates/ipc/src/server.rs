@@ -440,7 +440,9 @@ impl From<SnapshotFile> for Snapshot {
 /// only a presentation/mount concern, so a duplicate name is retained for the
 /// first point and later points receive a deterministic ID-based suffix.
 fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
-    let mut point_ids = HashSet::new();
+    // IDs live in one namespace shared by data and repo points, across all
+    // users. Validate that first, up front, before touching names.
+    crate::core::validate_point_ids(users.iter()).map_err(map_vfs)?;
 
     let mut usernames = HashSet::new();
 
@@ -456,20 +458,6 @@ fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
         let mut names = HashSet::new();
 
         for point in &mut user.points {
-            if point.id.is_nil() {
-                return Err(Status::invalid_argument(format!(
-                    "point '{}' for user '{}' has a nil ID",
-                    point.name, user.username
-                )));
-            }
-
-            if !point_ids.insert(point.id) {
-                return Err(Status::invalid_argument(format!(
-                    "duplicate VFS point ID '{}'",
-                    point.id
-                )));
-            }
-
             if point.name.is_empty() {
                 return Err(Status::invalid_argument(format!(
                     "point '{}' for user '{}' has an empty name",
@@ -547,8 +535,10 @@ fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
 /// Resolves a `FilePath` into the user's actual VFS mount path.
 ///
 /// Indexed paths are ID-based so a point can be renamed without invalidating
-/// clients that already have its stable ID. The resulting VFS path still uses
-/// the point's current name because mount names are the user-facing namespace.
+/// clients that already have its stable ID. Both data points (`/points/...`)
+/// and repo points (`/repos/...`) can be addressed this way. The resulting VFS
+/// path still uses the point's current name because mount names are the
+/// user-facing namespace.
 fn resolve_file_path(user: &VfsUser, path: &FilePath) -> Result<String, Status> {
     match &path.path {
         None => Err(Status::invalid_argument("path is blank")),
@@ -563,29 +553,19 @@ fn resolve_file_path(user: &VfsUser, path: &FilePath) -> Result<String, Status> 
             }
         }
         Some(Path::Indexed(path)) => {
-            let point_id = Uuid::parse_str(&path.point_id)
-                .map_err(|_| Status::invalid_argument("malformed point_id"))?;
+            // The ID alone selects the point (data and repo points share one
+            // ID space); the point's kind then selects /points vs /repos.
+            let point = utils::find_point_id(user, &path.point_id)?;
 
-            let point = user
-                .points
-                .iter()
-                .find(|point| point.id == point_id)
-                .ok_or_else(|| Status::not_found(format!("point '{}' not found", path.point_id)))?;
-
-            if point.is_repo {
-                return Err(Status::invalid_argument(format!(
-                    "point '{}' is a repo point; indexed paths only support data points",
-                    point.name
-                )));
+            // Same traversal protection as virtual paths: reject `..` and
+            // prefix components so an indexed path can't escape its point.
+            let rel = utils::validate_relative_point_path(&path.point_path)?;
+            let mount = utils::point_mount_path(point);
+            if rel.is_empty() {
+                Ok(mount)
+            } else {
+                Ok(format!("{mount}/{rel}"))
             }
-
-            Ok(format!(
-                "{}/{}",
-                utils::data_mount_path(&point.name),
-                path.point_path
-                    .strip_prefix("/")
-                    .unwrap_or(&path.point_path)
-            ))
         }
     }
 }
@@ -2383,10 +2363,22 @@ where
         let src_path_for_point = resolve_file_path(&src_user, old_file)?;
         let dst_path_for_point = resolve_file_path(&dst_user, new_file)?;
 
-        let (src_point, _) = utils::resolve_data_path(&src_user, &src_path_for_point)?;
+        // The source may be a data point or a repo point (copying a file out
+        // of a repository snapshot is fine); the destination must be a
+        // writable data point.
+        let (src_point, _) = utils::resolve_point_path(&src_user, &src_path_for_point)?;
         let (dst_point, dst_rest) = utils::resolve_data_path(&dst_user, &dst_path_for_point)?;
 
         utils::require_writable(dst_point)?;
+        if !args.copy {
+            // A move deletes the source, so it needs a writable data source.
+            if src_point.is_repo {
+                return Err(Status::permission_denied(
+                    "cannot move out of a repository; use copy instead",
+                ));
+            }
+            utils::require_writable(src_point)?;
+        }
 
         let (src_op, src_path) = self.get_operator(old_file, false).await?;
         let (dst_op, dst_path) = self.get_operator(new_file, false).await?;

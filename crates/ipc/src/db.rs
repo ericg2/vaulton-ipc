@@ -104,6 +104,14 @@ impl DbManager {
     /// Upsert a single user — inserts if absent, replaces all fields if present.
     pub async fn save_user(&self, user: &VfsUser) -> VfsResult<()> {
         validate_db_username(&user.username)?;
+
+        // The upserted user's point IDs must not collide with any other
+        // user's (or its own).
+        let mut all = self.get_users().await?;
+        all.retain(|u| u.username != user.username);
+        all.push(user.clone());
+        crate::core::validate_point_ids(&all)?;
+
         let points_json = serde_json::to_string(&user.points)?;
 
         sqlx::query(
@@ -162,6 +170,10 @@ impl UserSystem for DbManager {
                 )));
             }
         }
+
+        // Point IDs must be unique across all users and across data/repo
+        // kinds; refuse to persist a configuration that violates that.
+        crate::core::validate_point_ids(&users)?;
 
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM users").execute(&mut *tx).await?;

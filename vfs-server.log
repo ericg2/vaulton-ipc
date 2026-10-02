@@ -1,0 +1,32 @@
+22:00:57 [INFO] VFS server starting
+22:00:57 [INFO] log level: Info
+22:00:57 [INFO] log file: vfs-server.log
+22:00:57 [INFO] database: poop.sqlite
+22:00:57 [INFO] gRPC address: 127.0.0.1:8080
+22:00:57 [INFO] FTP address: 127.0.0.1:2121
+22:00:57 [INFO] listening: grpc 127.0.0.1:8080, ftp 127.0.0.1:2121
+22:00:57 [INFO] listen; self=ServerBuilder { authenticator: ftp, user_detail_provider: ftp, collect_metrics: false, active_passive_mode: PassiveOnly, greeting: "Welcome to the libunftp FTP server", logger: Logger(), metrics: false, passive_ports: 49152..=65535, passive_host: FromConnection, ftps_mode: Off, ftps_required_control_chan: None, ftps_required_data_chan: None, idle_session_timeout: 600s, listener_mode: Legacy, failed_logins_policy: None } bind_address="127.0.0.1:2121"
+22:00:58 [INFO] shutdown signal received
+22:00:58 [INFO] VFS server stopped
+22:01:07 [INFO] VFS server starting
+22:01:07 [INFO] log level: Info
+22:01:07 [INFO] log file: vfs-server.log
+22:01:07 [INFO] database: poop.sqlite
+22:01:07 [INFO] gRPC address: 127.0.0.1:8080
+22:01:07 [INFO] FTP address: 127.0.0.1:2121
+22:01:07 [INFO] listening: grpc 127.0.0.1:8080, ftp 127.0.0.1:2121
+22:01:07 [INFO] listen; self=ServerBuilder { authenticator: ftp, user_detail_provider: ftp, collect_metrics: false, active_passive_mode: PassiveOnly, greeting: "Welcome to the libunftp FTP server", logger: Logger(), metrics: false, passive_ports: 49152..=65535, passive_host: FromConnection, ftps_mode: Off, ftps_required_control_chan: None, ftps_required_data_chan: None, idle_session_timeout: 600s, listener_mode: Legacy, failed_logins_policy: None } bind_address="127.0.0.1:2121"
+22:01:53 [WARN] Detected change on user: Eric. Invalidating...
+22:02:03 [INFO] repository opendal:fs:: password is correct.
+22:02:03 [INFO] using cache at C:\Users\Eric\AppData\Local\rustic\80f077f157483c5a2f838bf722beee81dfa4d3884de52254ee22fc2cc9aead4f
+22:02:03 [INFO] 
+22:02:03 [INFO] reading index...
+22:02:03 [INFO] finished.
+22:02:03 [INFO] getting snapshots...
+22:02:03 [INFO] finished.
+22:02:03 [INFO] point 'eric-data' of user 'admin' loaded
+22:02:03 [INFO] point 'eric-repo' of user 'admin' loaded
+22:02:03 [INFO] getting snapshots...
+22:02:03 [INFO] finished.
+22:03:29 [INFO] shutdown signal received
+22:03:29 [INFO] VFS server stopped

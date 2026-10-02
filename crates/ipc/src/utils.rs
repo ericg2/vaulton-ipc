@@ -15,6 +15,7 @@ pub fn map_vfs(e: VfsError) -> Status {
         VfsError::UserNotFound => Status::not_found("vfs user not found"),
         VfsError::RepoPasswordMissing => Status::failed_precondition(e.to_string()),
         VfsError::PointFailed { .. } => Status::failed_precondition(e.to_string()),
+        VfsError::InvalidConfig(_) => Status::invalid_argument(e.to_string()),
         VfsError::OpenDal(e) => map_dal(e),
         _ => Status::internal(e.to_string()),
     }
@@ -214,21 +215,48 @@ pub fn quota_id(username: &str, point_id: &Uuid) -> String {
 
 // ── Point lookup & validation ─────────────────────────────────────────────────
 
-fn find_point<'a>(user: &'a VfsUser, name: &str) -> Result<&'a VfsPoint, Status> {
+/// Name lookup is scoped to a kind because `/points/<name>` and
+/// `/repos/<name>` are separate namespaces; a data point can never shadow a
+/// repo point of the same name (or vice versa).
+fn find_point<'a>(user: &'a VfsUser, name: &str, is_repo: bool) -> Result<&'a VfsPoint, Status> {
     user.points
         .iter()
-        .find(|p| p.name == name)
-        .ok_or_else(|| Status::not_found(format!("point '{name}' not found")))
+        .find(|p| p.name == name && p.is_repo == is_repo)
+        .ok_or_else(|| {
+            let kind = if is_repo { "repo" } else { "data" };
+            Status::not_found(format!("{kind} point '{name}' not found"))
+        })
 }
 
-fn find_point_id<'a>(user: &'a VfsUser, id: &str) -> Result<&'a VfsPoint, Status> {
+/// Resolves a point of *either* kind from its stable ID.
+///
+/// Data and repo points share a single ID space (enforced by
+/// [`crate::core::validate_point_ids`]), so an ID resolves to at most one
+/// point. If a corrupt configuration still contains the same ID twice, this
+/// fails instead of silently picking the first match.
+pub fn find_point_id<'a>(user: &'a VfsUser, id: &str) -> Result<&'a VfsPoint, Status> {
     let id = uuid::Uuid::parse_str(id)
         .map_err(|_| Status::invalid_argument(format!("malformed point id '{id}'")))?;
 
-    user.points
-        .iter()
-        .find(|p| p.id == id)
-        .ok_or_else(|| Status::not_found(format!("point '{id}' not found")))
+    let mut matches = user.points.iter().filter(|p| p.id == id);
+    let first = matches
+        .next()
+        .ok_or_else(|| Status::not_found(format!("point '{id}' not found")))?;
+    if matches.next().is_some() {
+        return Err(Status::failed_precondition(format!(
+            "point ID '{id}' is ambiguous (duplicated in the configuration)"
+        )));
+    }
+    Ok(first)
+}
+
+/// VFS-visible mount path of a point, chosen by its kind.
+pub fn point_mount_path(point: &VfsPoint) -> String {
+    if point.is_repo {
+        repo_mount_path(&point.name)
+    } else {
+        data_mount_path(&point.name)
+    }
 }
 
 /// Locates a repo point by its stable ID.
@@ -263,26 +291,14 @@ pub fn require_data_point_id<'a>(
 ///
 /// Name lookup remains available for VFS-visible paths such as `/repos/name`.
 pub fn require_repo_point<'a>(user: &'a VfsUser, name: &str) -> Result<&'a VfsPoint, Status> {
-    let point = find_point(user, name)?;
-    if !point.is_repo {
-        return Err(Status::invalid_argument(format!(
-            "point '{name}' is a data point, not a repo"
-        )));
-    }
-    Ok(point)
+    find_point(user, name, true)
 }
 
 /// Locates a data point by its user-facing name.
 ///
 /// Name lookup remains available for VFS-visible paths such as `/points/name`.
 pub fn require_data_point<'a>(user: &'a VfsUser, name: &str) -> Result<&'a VfsPoint, Status> {
-    let point = find_point(user, name)?;
-    if point.is_repo {
-        return Err(Status::invalid_argument(format!(
-            "point '{name}' is a repo, not a data point"
-        )));
-    }
-    Ok(point)
+    find_point(user, name, false)
 }
 
 /// Rejects `point` if it's marked read-only.
@@ -479,6 +495,36 @@ pub fn resolve_data_file_path<'a>(
     }
 }
 
+/// Resolves a VFS path under either `/points/<name>/...` or
+/// `/repos/<name>/...` to its point (of the matching kind) and the path
+/// relative to that point.
+pub fn resolve_point_path<'a>(
+    user: &'a VfsUser,
+    vfs_path: &str,
+) -> Result<(&'a VfsPoint, PathBuf), Status> {
+    let trimmed = vfs_path.trim_start_matches('/');
+    let mut parts = trimmed.splitn(3, '/');
+
+    let root = parts.next().unwrap_or("");
+    let is_repo = match root {
+        POINTS_ROOT => false,
+        REPOS_ROOT => true,
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "path '{vfs_path}' must be under /{POINTS_ROOT}/<name>/... or /{REPOS_ROOT}/<name>/..."
+            )));
+        }
+    };
+
+    let point_name = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
+        Status::invalid_argument(format!("path '{vfs_path}' is missing a point name"))
+    })?;
+
+    let rest = validate_relative_point_path(parts.next().unwrap_or(""))?;
+    let point = find_point(user, point_name, is_repo)?;
+    Ok((point, PathBuf::from(rest)))
+}
+
 pub fn resolve_data_path<'a>(
     user: &'a VfsUser,
     vfs_path: &str,
@@ -645,6 +691,67 @@ mod tests {
         let (point, rest) = resolve_data_file_path(&u, &path).unwrap();
         assert_eq!(point.name, "d");
         assert_eq!(rest, "sub/file.txt");
+    }
+
+    #[test]
+    fn find_point_id_resolves_either_kind() {
+        let d = data_point("same", false);
+        let r = repo_point("same", false, Some("pw"));
+        let (did, rid) = (d.id.to_string(), r.id.to_string());
+        let u = user(vec![d, r]);
+        assert!(!find_point_id(&u, &did).unwrap().is_repo);
+        assert!(find_point_id(&u, &rid).unwrap().is_repo);
+    }
+
+    #[test]
+    fn find_point_id_rejects_duplicate_ids() {
+        let d = data_point("d", false);
+        let mut r = repo_point("r", false, Some("pw"));
+        r.id = d.id;
+        let id = d.id.to_string();
+        let u = user(vec![d, r]);
+        assert_eq!(
+            find_point_id(&u, &id).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn name_lookup_is_scoped_by_kind() {
+        let u = user(vec![
+            data_point("same", false),
+            repo_point("same", false, Some("pw")),
+        ]);
+        assert!(!require_data_point(&u, "same").unwrap().is_repo);
+        assert!(require_repo_point(&u, "same").unwrap().is_repo);
+    }
+
+    #[test]
+    fn resolve_point_path_handles_both_roots() {
+        let u = user(vec![
+            data_point("d", false),
+            repo_point("r", false, Some("pw")),
+        ]);
+        let (p, rest) = resolve_point_path(&u, "/points/d/a/b").unwrap();
+        assert!(!p.is_repo);
+        assert_eq!(rest, PathBuf::from("a/b"));
+        let (p, _) = resolve_point_path(&u, "/repos/r/snapshots").unwrap();
+        assert!(p.is_repo);
+        assert!(resolve_point_path(&u, "/points/r/x").is_err());
+        assert!(resolve_point_path(&u, "/repos/d/x").is_err());
+        assert!(resolve_point_path(&u, "/points/d/../x").is_err());
+    }
+
+    #[test]
+    fn validate_point_ids_rejects_cross_kind_and_cross_user_duplicates() {
+        let d = data_point("d", false);
+        let mut r = repo_point("r", false, Some("pw"));
+        r.id = d.id;
+        assert!(crate::core::validate_point_ids([&user(vec![d.clone(), r.clone()])]).is_err());
+
+        let mut other = user(vec![r]);
+        other.username = "bob".into();
+        assert!(crate::core::validate_point_ids([&user(vec![d]), &other]).is_err());
     }
 
     #[test]
