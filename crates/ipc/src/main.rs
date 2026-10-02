@@ -29,7 +29,6 @@ pub mod ipc {
 mod core;
 mod db;
 mod event_bus;
-mod ftp;
 mod progress;
 mod server;
 mod store;
@@ -39,7 +38,6 @@ const TTL: Duration = Duration::from_mins(3);
 
 const DEFAULT_DB_PATH: &str = "poop.sqlite";
 const DEFAULT_GRPC_ADDR: &str = "127.0.0.1:8080";
-const DEFAULT_FTP_ADDR: &str = "127.0.0.1:2121";
 const DEFAULT_LOG_FILE: &str = "vfs-server.log";
 
 /// Log level exposed through the command line.
@@ -72,8 +70,8 @@ impl From<LogLevel> for LevelFilter {
 #[command(
     name = "vfs-server",
     version,
-    about = "VFS gRPC/FTP server",
-    long_about = "Runs the VFS gRPC and FTP servers and persists metadata in SQLite."
+    about = "VFS gRPC server",
+    long_about = "Runs the VFS gRPC server and persists metadata in SQLite."
 )]
 struct Args {
     /// Path to the SQLite database.
@@ -93,15 +91,6 @@ struct Args {
         value_name = "ADDR"
     )]
     grpc_addr: String,
-
-    /// Address for the FTP server.
-    #[arg(
-        long,
-        env = "VFS_FTP_ADDR",
-        default_value = DEFAULT_FTP_ADDR,
-        value_name = "ADDR"
-    )]
-    ftp_addr: String,
 
     /// Minimum log level.
     ///
@@ -179,20 +168,12 @@ impl Log for ChannelLogger {
             return;
         }
 
-        // libunftp is extremely noisy at INFO/DEBUG/TRACE. Keep its
-        // warnings and errors because authentication failures and other
-        // operational problems are useful.
-        if record.target().starts_with("libunftp") && record.level() < log::Level::Warn {
-            return;
-        }
-
         self.logger.log(record);
 
         // Forward our own crate at any level, but only warnings+ from
         // dependencies (hyper/h2/tonic debug logs would flood the event
         // queue, and every Poll would generate more of them).
         let ours = record.target().starts_with(env!("CARGO_CRATE_NAME"));
-
         if !ours && record.level() > log::Level::Warn {
             return;
         }
@@ -300,7 +281,6 @@ async fn main() {
 
     info!("database: {}", args.db_path.display());
     info!("gRPC address: {}", args.grpc_addr);
-    info!("FTP address: {}", args.ftp_addr);
     if let Err(e) = run(args, tx, rx).await {
         error!("fatal: {e}");
         std::process::exit(1);
@@ -319,144 +299,31 @@ async fn run(
     let db = Arc::new(DbManager::open(&db_path).await?);
     let store = Arc::new(StorageManager::new(db.clone(), TTL, tx.clone()));
     let serv = GrpcServer::new(store.clone(), db.clone(), store.state.clone(), tx, rx);
-    let ftp = Arc::new(ftp::FtpServer::new(store.clone(), db.clone()));
-    let ftp_server = libunftp::ServerBuilder::with_user_detail_provider(
-        Box::new({
-            let ftp = ftp.clone();
-            move || (*ftp).clone()
-        }),
-        ftp.clone(),
-    )
-    .authenticator(ftp)
-    .build()?;
-
     // WriteAt chunks can exceed tonic's 4 MiB default decode limit.
     let svc = IpcServiceServer::new(serv.clone())
         .max_decoding_message_size(48 * 1024 * 1024)
         .max_encoding_message_size(48 * 1024 * 1024);
 
-    info!("listening: grpc {}, ftp {}", args.grpc_addr, args.ftp_addr);
-
-    // One broadcast channel is used to coordinate shutdown between
-    // the gRPC and FTP server tasks.
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-
-    let signal_tx = shutdown_tx.clone();
-
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = signal_tx.send(());
-    });
-
-    let mut grpc_shutdown = shutdown_tx.subscribe();
+    info!("listening: grpc {}", args.grpc_addr);
 
     let grpc_addr = args.grpc_addr.parse()?;
 
-    let mut grpc = tokio::spawn(async move {
-        Server::builder()
-            .tcp_nodelay(true)
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .http2_keepalive_interval(Some(Duration::from_secs(30)))
-            .add_service(svc)
-            .serve_with_shutdown(grpc_addr, async move {
-                let _ = grpc_shutdown.recv().await;
-            })
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
-    });
+    let result = Server::builder()
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .add_service(svc)
+        .serve_with_shutdown(grpc_addr, shutdown_signal())
+        .await;
 
-    let ftp_addr = args.ftp_addr;
-    let mut ftp = tokio::spawn(async move {
-        ftp_server
-            .listen(&ftp_addr)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
-    });
-
-    let mut main_shutdown = shutdown_tx.subscribe();
-    tokio::select! {
-        result = &mut grpc => {
-            match result {
-                Ok(Ok(())) => {
-                    info!("gRPC server stopped");
-                }
-                Ok(Err(e)) => {
-                    error!("gRPC server stopped with error: {e}");
-                }
-                Err(e) => {
-                    error!("gRPC server task panicked: {e}");
-                }
-            }
-
-            tokio::select! {
-                result = &mut ftp => {
-                    match result {
-                        Ok(Ok(())) => {
-                            info!("FTP server stopped");
-                        }
-                        Ok(Err(e)) => {
-                            error!("FTP server stopped with error: {e}");
-                        }
-                        Err(e) => {
-                            error!("FTP server task panicked: {e}");
-                        }
-                    }
-                }
-
-                _ = main_shutdown.recv() => {
-                    // FTP has no shutdown future in this API, so abort
-                    // the listener when coordinated shutdown occurs.
-                    ftp.abort();
-                    let _ = ftp.await;
-                }
-            }
-        }
-
-        result = &mut ftp => {
-            match result {
-                Ok(Ok(())) => {
-                    info!("FTP server stopped");
-                }
-                Ok(Err(e)) => {
-                    error!("FTP server stopped with error: {e}");
-                }
-                Err(e) => {
-                    error!("FTP server task panicked: {e}");
-                }
-            }
-
-            tokio::select! {
-                result = &mut grpc => {
-                    match result {
-                        Ok(Ok(())) => {
-                            info!("gRPC server stopped");
-                        }
-                        Ok(Err(e)) => {
-                            error!("gRPC server stopped with error: {e}");
-                        }
-                        Err(e) => {
-                            error!("gRPC server task panicked: {e}");
-                        }
-                    }
-                }
-
-                _ = main_shutdown.recv() => {
-                    grpc.abort();
-                    let _ = grpc.await;
-                }
-            }
-        }
-
-        _ = main_shutdown.recv() => {
-            // Ctrl-C: terminate both listeners.
-            grpc.abort();
-            ftp.abort();
-
-            let _ = grpc.await;
-            let _ = ftp.await;
-        }
-    }
-
+    // Cancel jobs and close write handles whether we stopped cleanly or not.
     serv.shutdown().await;
-    Ok(())
+
+    match result {
+        Ok(()) => {
+            info!("gRPC server stopped");
+            Ok(())
+        }
+        Err(e) => Err(Box::new(e) as Box<dyn Error + Send + Sync>),
+    }
 }

@@ -67,7 +67,6 @@ impl DbManager {
             r#"
         CREATE TABLE IF NOT EXISTS users (
             username      TEXT PRIMARY KEY NOT NULL,
-            password      TEXT NOT NULL DEFAULT '',
             points        TEXT NOT NULL DEFAULT '[]'
         ) STRICT;
 
@@ -80,18 +79,18 @@ impl DbManager {
         .execute(&self.pool)
         .await?;
 
+        // Databases created before FTP removal still carry a `password`
+        // column; drop it so the schema matches the code.
         let has_password: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'password'",
         )
         .fetch_one(&self.pool)
         .await?;
 
-        if has_password == 0 {
-            sqlx::query(
-                "ALTER TABLE users ADD COLUMN password TEXT NOT NULL DEFAULT ''",
-            )
-            .execute(&self.pool)
-            .await?;
+        if has_password > 0 {
+            sqlx::query("ALTER TABLE users DROP COLUMN password")
+                .execute(&self.pool)
+                .await?;
         }
 
         Ok(())
@@ -116,15 +115,13 @@ impl DbManager {
 
         sqlx::query(
             r#"
-        INSERT INTO users (username, password, points)
-        VALUES (?1, ?2, ?3)
+        INSERT INTO users (username, points)
+        VALUES (?1, ?2)
         ON CONFLICT(username) DO UPDATE SET
-            password = excluded.password,
-            points   = excluded.points
+            points = excluded.points
         "#,
         )
         .bind(&user.username)
-        .bind(&user.password_hash)
         .bind(&points_json)
         .execute(&self.pool)
         .await?;
@@ -151,7 +148,7 @@ impl DbManager {
 impl UserSystem for DbManager {
     async fn get_user(&self, username: &str) -> VfsResult<VfsUser> {
         sqlx::query_as::<_, UserRow>(
-            "SELECT username, password, points FROM users WHERE username = ?1",
+            "SELECT username, points FROM users WHERE username = ?1",
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -183,12 +180,11 @@ impl UserSystem for DbManager {
 
             sqlx::query(
                 r#"
-            INSERT INTO users (username, password, points)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO users (username, points)
+            VALUES (?1, ?2)
             "#,
             )
             .bind(&user.username)
-            .bind(&user.password_hash)
             .bind(&points_json)
             .execute(&mut *tx)
             .await?;
@@ -200,7 +196,7 @@ impl UserSystem for DbManager {
 
     async fn get_users(&self) -> VfsResult<Vec<VfsUser>> {
         let rows = sqlx::query_as::<_, UserRow>(
-            "SELECT username, password, points FROM users ORDER BY username",
+            "SELECT username, points FROM users ORDER BY username",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -290,7 +286,6 @@ fn db_err(context: &'static str) -> impl Fn(sqlx::Error) -> opendal_core::Error 
 #[derive(sqlx::FromRow)]
 struct UserRow {
     username: String,
-    password: String,
     points: String, // JSON-encoded Vec<VfsPoint>
 }
 
@@ -302,7 +297,6 @@ impl TryFrom<UserRow> for VfsUser {
 
         Ok(VfsUser {
             username: row.username,
-            password_hash: row.password,
             points,
         })
     }
@@ -321,7 +315,6 @@ mod tests {
     fn dummy_user(name: &str) -> VfsUser {
         VfsUser {
             username: name.to_string(),
-            password_hash: "password".to_string(),
             points: vec![VfsPoint {
                 id: Uuid::new_v4(),
                 name: "primary".to_string(),
@@ -356,7 +349,6 @@ mod tests {
 
         let loaded = mgr.get_user("alice").await.expect("Should exist");
         assert_eq!(loaded.username, "alice");
-        assert_eq!(loaded.password_hash, "password");
         assert_eq!(loaded.points.len(), 1);
         assert_eq!(loaded.points[0].name, "primary");
     }
@@ -382,14 +374,12 @@ mod tests {
 
         let updated = VfsUser {
             username: "carol".to_string(),
-            password_hash: "new-password".to_string(),
             points: vec![],
         };
 
         mgr.save_user(&updated).await.unwrap();
 
         let loaded = mgr.get_user("carol").await.unwrap();
-        assert_eq!(loaded.password_hash, "new-password");
         assert!(loaded.points.is_empty());
     }
 

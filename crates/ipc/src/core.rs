@@ -1,14 +1,16 @@
 //! Per-user virtual filesystem.
 //!
-//! Composes quota-guarded data-layer points and read-only rustic repository
-//! mounts into a single [`Operator`] per user.
+//! Composes data-layer points and read-only rustic repository mounts into a
+//! single [`Operator`] per user. Only local/fs-backed data points are ever
+//! writable through the VFS; remote data points and repos are read-only there
+//! (backup/restore jobs still reach them through dedicated operators).
 //!
 //! # Layout inside each user's operator
 //!
 //! ```text
 //! /
 //! ├── points/
-//! │   ├── <name>/   ← raw data operator; quota-enforced when writable
+//! │   ├── <name>/   ← raw data operator; writable only if local/fs-backed
 //! │   └── ...
 //! └── repos/
 //!     ├── <name>/   ← rustic VFS operator; always read-only
@@ -23,9 +25,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt::Formatter;
 use thiserror::Error;
-use unftp_core::auth::UserDetail;
 use uuid::Uuid;
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -84,15 +84,17 @@ pub struct VfsPoint {
     pub name: String,
 
     /// Maximum cumulative bytes this point may receive via writes.
-    /// `None` means unlimited. Ignored when `readonly` is `true`.
+    /// `None` means unlimited. Ignored when `read_only` is `true`.
     pub max_bytes: Option<u64>,
 
-    /// When `true`, writes and deletes are rejected at the mount level.
+    /// When `true`, writes and deletes are rejected.
     ///
-    /// For data points this gates the VFS mount directly. For repo points
-    /// the VFS mount is always read-only regardless of this flag — instead,
-    /// here it gates whether backup/forget jobs may write to the repo at
-    /// all (see `utils::require_writable` in the server layer).
+    /// For local data points this gates the VFS mount directly. Remote data
+    /// points are never user-writable through the VFS regardless of this
+    /// flag (see `utils::is_user_writable`); here it only gates restore jobs
+    /// into them. For repo points the VFS mount is always read-only — the
+    /// flag gates whether backup/forget jobs and password changes may write
+    /// to the repo (see `utils::require_writable` in the server layer).
     pub read_only: bool,
 
     /// The storage scheme to use. Example: `s3`.
@@ -147,20 +149,9 @@ pub struct VfsUser {
     /// one shared [`QuotaTracker`] correctly isolates every user.
     pub username: String,
 
-    /// The password to use.
-    pub password_hash: String,
-
     /// Ordered mount points owned by this user.
     pub points: Vec<VfsPoint>,
 }
-
-impl std::fmt::Display for VfsUser {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.username)
-    }
-}
-
-impl UserDetail for VfsUser {}
 
 // ── VfsStore ──────────────────────────────────────────────────────────────────
 /// Database persistence for [`VfsUser`] records.

@@ -318,6 +318,37 @@ pub fn require_writable(point: &VfsPoint) -> Result<(), Status> {
     }
 }
 
+/// Whether a *user* (via the `Vfs_*` write calls) may modify `point`.
+///
+/// Only writable, local/fs-backed data points qualify. Remote backends and
+/// repositories are read-only for users; backup/restore jobs still write to
+/// them through [`StorageSystem::get_data_operator`](crate::store::StorageSystem::get_data_operator).
+pub fn is_user_writable(point: &VfsPoint) -> bool {
+    !point.is_repo && !point.read_only && is_local_scheme(&point.scheme)
+}
+
+/// Rejects `point` unless [`is_user_writable`]. The error says why.
+pub fn require_user_writable(point: &VfsPoint) -> Result<(), Status> {
+    if point.is_repo {
+        Err(Status::permission_denied(format!(
+            "repository '{}' is read-only",
+            point.name
+        )))
+    } else if !is_local_scheme(&point.scheme) {
+        Err(Status::permission_denied(format!(
+            "point '{}' uses remote scheme '{}'; remote points cannot be written to directly (backup/restore only)",
+            point.name, point.scheme
+        )))
+    } else if point.read_only {
+        Err(Status::permission_denied(format!(
+            "point '{}' is read-only",
+            point.name
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// Whether `scheme` should be backed up via [`LocalSource`](rustic_backend::local::LocalSource)
 /// instead of an OpenDAL operator.
 pub fn is_local_scheme(scheme: &str) -> bool {
@@ -525,30 +556,6 @@ pub fn resolve_point_path<'a>(
     Ok((point, PathBuf::from(rest)))
 }
 
-pub fn resolve_data_path<'a>(
-    user: &'a VfsUser,
-    vfs_path: &str,
-) -> Result<(&'a VfsPoint, PathBuf), Status> {
-    let trimmed = vfs_path.trim_start_matches('/');
-    let mut parts = trimmed.splitn(3, '/');
-
-    let root = parts.next().unwrap_or("");
-    if root != POINTS_ROOT {
-        return Err(Status::invalid_argument(format!(
-            "path '{vfs_path}' must be under /{POINTS_ROOT}/<name>/... (repo-mounted paths aren't supported for backup/restore)"
-        )));
-    }
-
-    let point_name = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        Status::invalid_argument(format!("path '{vfs_path}' is missing a point name"))
-    })?;
-
-    let rest = parts.next().unwrap_or("");
-    let point = require_data_point(user, point_name)?;
-    let rest = validate_relative_point_path(rest)?;
-    Ok((point, PathBuf::from(rest)))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -587,7 +594,6 @@ mod tests {
     fn user(points: Vec<VfsPoint>) -> VfsUser {
         VfsUser {
             username: "alice".into(),
-            password_hash: "pw".into(),
             points,
         }
     }
@@ -766,6 +772,37 @@ mod tests {
         assert!(require_writable(&p).is_ok());
     }
 
+    fn local_point(name: &str, read_only: bool) -> VfsPoint {
+        let mut p = data_point(name, read_only);
+        p.scheme = "fs".into();
+        p
+    }
+
+    #[test]
+    fn user_writable_only_for_writable_local_data_points() {
+        assert!(is_user_writable(&local_point("l", false)));
+        assert!(!is_user_writable(&local_point("l", true)));
+        assert!(!is_user_writable(&data_point("s3", false))); // remote
+        let mut repo = repo_point("r", false, Some("pw"));
+        repo.scheme = "fs".into();
+        assert!(!is_user_writable(&repo));
+    }
+
+    #[test]
+    fn require_user_writable_reports_permission_denied() {
+        assert!(require_user_writable(&local_point("l", false)).is_ok());
+        for p in [
+            local_point("l", true),
+            data_point("remote", false),
+            repo_point("r", false, Some("pw")),
+        ] {
+            assert_eq!(
+                require_user_writable(&p).unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+    }
+
     #[test]
     fn repo_source_requires_password() {
         let p = repo_point("r", false, None);
@@ -778,26 +815,6 @@ mod tests {
         let src = repo_source(&p).unwrap();
         assert_eq!(src.password, "secret");
         assert_eq!(src.scheme, "s3");
-    }
-
-    #[test]
-    fn resolve_data_path_requires_points_root() {
-        let u = user(vec![data_point("local", false)]);
-        assert!(resolve_data_path(&u, "/repos/local/x").is_err());
-    }
-
-    #[test]
-    fn resolve_data_path_splits_point_and_rest() {
-        let u = user(vec![data_point("local", false)]);
-        let (point, rest) = resolve_data_path(&u, "/points/local/sub/dir").unwrap();
-        assert_eq!(point.name, "local");
-        assert_eq!(rest, PathBuf::from("sub/dir"));
-    }
-
-    #[test]
-    fn resolve_data_path_rejects_unknown_point() {
-        let u = user(vec![data_point("local", false)]);
-        assert!(resolve_data_path(&u, "/points/ghost/x").is_err());
     }
 
     #[test]

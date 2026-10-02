@@ -28,7 +28,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use unftp_core::storage::StorageBackend;
 use uuid::Uuid;
 
 pub type RepoNoIndex = Repository<OpenStatus>;
@@ -80,19 +79,43 @@ pub trait StorageSystem: Send + Sync + 'static {
     /// Last recorded load state of a point, or `None` if never loaded.
     fn point_health(&self, id: &Uuid) -> Option<PointHealth>;
 
-    /// Builds an operator for a single named data point belonging to `user`,
-    /// applying the same read-only/quota layering as [`get_vfs`](Self::get_vfs)
-    /// applies to that point's mount.
+    /// Builds an operator for a single point belonging to `user`, for use by
+    /// backup/restore/check/forget **jobs**.
     ///
-    /// Intended for backup/restore jobs, which read/write a data point's
-    /// backend directly (via `OpenDALSource::new`) rather than through the
-    /// user's mounted VFS tree — without this, those jobs would bypass quota
-    /// enforcement and the point's read-only flag entirely.
+    /// Jobs read/write a point's backend directly (via `OpenDALSource::new`)
+    /// rather than through the user's mounted VFS tree. This operator honours
+    /// the point's `read_only` flag and quota, but — unlike the VFS mount —
+    /// does *not* force remote data points read-only, because restoring into
+    /// a remote point is a legitimate job.
     fn get_data_operator(
         &self,
         user: &VfsUser,
         point: &VfsPoint,
     ) -> VfsResult<opendal_core::blocking::Operator>;
+
+    /// Phase 1 of a repository password change: makes `new_password` a valid
+    /// key of the repository identified by `old` (which carries the *old*
+    /// password). Both passwords work afterwards.
+    ///
+    /// No-op if the repository does not exist yet (it will be created with the
+    /// new password) or if `new_password` already opens it. Fails if neither
+    /// password opens it, or if a key must be added but `allow_write` is false.
+    async fn add_repo_key(
+        &self,
+        old: &RepoSource,
+        new_password: &str,
+        allow_write: bool,
+    ) -> RusticResult<()>;
+
+    /// Phase 2 of a repository password change: once the new password is
+    /// persisted, removes the key belonging to `old.password` from the
+    /// repository. No-op if the old password no longer opens it.
+    async fn remove_old_repo_key(
+        &self,
+        old: &RepoSource,
+        new_password: &str,
+        allow_write: bool,
+    ) -> RusticResult<()>;
 }
 
 /// Identifies a rustic repository by its storage scheme and decryption
@@ -284,6 +307,106 @@ impl StorageManager {
             .to_indexed()
     }
 
+    /// Opens (without indexing) the repository at `scheme`/`config` using
+    /// `password`.
+    fn open_repo_with(
+        scheme: &str,
+        config: &BTreeMap<String, String>,
+        password: &str,
+    ) -> RusticResult<RepoNoIndex> {
+        let config = OpenDALConfig::default()
+            .scheme(scheme.to_string())
+            .options(config.clone().into_iter().collect::<HashMap<_, _>>());
+        let backend = BackendOptions::default().with_repo(&config).to_backends()?;
+        Repository::new(&RepositoryOptions::default(), &backend)?
+            .open(&Credentials::password(password))
+    }
+
+    fn repo_lock(&self, src: &RepoSource) -> Arc<StdMutex<()>> {
+        self.repo_locks
+            .entry(src.clone())
+            .or_insert_with(|| Arc::new(StdMutex::new(())))
+            .clone()
+    }
+
+    fn add_repo_key_blocking(
+        &self,
+        old: &RepoSource,
+        new_password: &str,
+        allow_write: bool,
+    ) -> RusticResult<()> {
+        let lock = self.repo_lock(old);
+        let _guard = lock
+            .lock()
+            .map_err(|_| repo_err("repository lock poisoned"))?;
+
+        if !repo_exists(&Self::probe(old)?)? {
+            info!("repository does not exist yet; new password will be used on creation");
+            return Ok(());
+        }
+
+        // Already rotated (e.g. a previous SetVfs was interrupted, or the
+        // password was changed outside this server): nothing to add.
+        if Self::open_repo_with(&old.scheme, &old.config, new_password).is_ok() {
+            info!("repository already opens with the new password");
+            return Ok(());
+        }
+
+        let repo = Self::open_repo_with(&old.scheme, &old.config, &old.password).map_err(|e| {
+            repo_err(format!(
+                "cannot open the repository with the old or the new password: {e}"
+            ))
+        })?;
+
+        if !allow_write {
+            return Err(repo_err(
+                "repository point is read-only; cannot add a key for the new password",
+            ));
+        }
+
+        repo.add_key(new_password, &KeyOptions::default())?;
+        info!("added key for the new repository password");
+        Ok(())
+    }
+
+    fn remove_old_repo_key_blocking(
+        &self,
+        old: &RepoSource,
+        new_password: &str,
+        allow_write: bool,
+    ) -> RusticResult<()> {
+        let lock = self.repo_lock(old);
+        let _guard = lock
+            .lock()
+            .map_err(|_| repo_err("repository lock poisoned"))?;
+
+        if !repo_exists(&Self::probe(old)?)? {
+            return Ok(());
+        }
+
+        let new_repo = Self::open_repo_with(&old.scheme, &old.config, new_password)?;
+        // Old password already gone (or never matched): nothing to remove.
+        let Ok(old_repo) = Self::open_repo_with(&old.scheme, &old.config, &old.password) else {
+            return Ok(());
+        };
+        let (Some(old_key), Some(new_key)) = (old_repo.key_id(), new_repo.key_id()) else {
+            return Err(repo_err("opened repository did not report its key id"));
+        };
+        if old_key == new_key {
+            return Ok(());
+        }
+        if !allow_write {
+            return Err(repo_err(
+                "repository point is read-only; cannot remove the old key",
+            ));
+        }
+
+        // The key in use cannot delete itself, hence the second handle.
+        new_repo.delete_key(old_key)?;
+        info!("removed key of the old repository password");
+        Ok(())
+    }
+
     /// Job-scoped variant with progress events over `tx`.
     fn create_for_job(
         &self,
@@ -308,15 +431,10 @@ impl StorageManager {
         }
     }
 
-    /// Builds a single-point operator with the read-only/quota policy from
-    /// `point` applied directly as OpenDAL layers.
-    ///
-    /// This is the one place read-only and quota layering for data points is
-    /// wired up: it's reused both when composing a user's full VFS tree and
-    /// when a backup/restore job needs to touch a single point's backend
-    /// directly. `VfsBuilder` refuses to mount at its virtual root `"/"`, so
-    /// this applies [`ReadOnlyLayer`]/[`QuotaLayer`] straight to the raw
-    /// operator instead of routing through a single-mount `VfsBuilder`.
+    /// Builds the operator used by **jobs** (backup/restore/check/forget) for
+    /// a single point, applying the point's own read-only/quota policy as
+    /// OpenDAL layers. User-facing VFS mounts use [`mount_operator`](Self::mount_operator)
+    /// instead, which is stricter for remote points.
     fn point_operator(&self, user: &VfsUser, point: &VfsPoint) -> VfsResult<Operator> {
         let mut op = Operator::via_iter(&point.scheme, point.config.clone())?;
 
@@ -325,20 +443,17 @@ impl StorageManager {
         } else if let Some(max) = point.max_bytes {
             // Local/fs-backed *data* points are quota-checked against
             // their true on-disk footprint (`utils::dir_size`) directly by
-            // the IPC write handlers and by `FtpServer::put` in `ftp.rs`,
-            // instead of through this incremental write-counter layer.
-            // Skip it here so the two accounting mechanisms don't both
-            // apply (and disagree) for the same point — see
-            // `utils::dir_size` for why the counter isn't trustworthy for
-            // data points any more.
+            // the IPC write handlers, instead of through this incremental
+            // write-counter layer. Skip it here so the two accounting
+            // mechanisms don't both apply (and disagree) for the same
+            // point — see `utils::dir_size`.
             //
             // Repo points are excluded from that switch even when they're
             // also local/fs-backed: their content is written by rustic
-            // during backup jobs (`get_data_operator`, not the
-            // `Vfs_OpenWrite`/`Vfs_WriteAt` handles or `Vfs_WriteFile`), so
-            // there's no code path that would ever perform a `dir_size`
-            // check for them — leaving the counter attached here is the
-            // only enforcement they get.
+            // during backup jobs, so there's no code path that would ever
+            // perform a `dir_size` check for them — leaving the counter
+            // attached here is the only enforcement they get. Remote data
+            // points likewise only receive writes from restore jobs.
             if point.is_repo || !utils::is_local_scheme(&point.scheme) {
                 op = op.layer(QuotaLayer::new(
                     self.state.clone(),
@@ -351,10 +466,22 @@ impl StorageManager {
         Ok(op)
     }
 
+    /// Builds the operator mounted into the user's VFS tree for a *data*
+    /// point. Only writable local/fs-backed points are mutable here; every
+    /// remote backend is mounted read-only so users cannot write to it
+    /// (backup/restore jobs use [`point_operator`](Self::point_operator)).
+    fn mount_operator(&self, point: &VfsPoint) -> VfsResult<Operator> {
+        let mut op = Operator::via_iter(&point.scheme, point.config.clone())?;
+        if !utils::is_user_writable(point) {
+            op = op.layer(ReadOnlyLayer);
+        }
+        Ok(op)
+    }
+
     /// Builds one mount. Any failure here only affects this point.
-    fn build_mount(&self, user: &VfsUser, point: &VfsPoint) -> VfsResult<(String, Operator)> {
+    fn build_mount(&self, _user: &VfsUser, point: &VfsPoint) -> VfsResult<(String, Operator)> {
         if !point.is_repo {
-            let op = self.point_operator(user, point)?;
+            let op = self.mount_operator(point)?;
             let probe = opendal_core::blocking::Operator::new(op.clone())?;
             match probe.list("") {
                 Ok(_) => {}
@@ -660,6 +787,38 @@ impl StorageSystem for StorageManager {
         self.data_ops.insert(point.id, x.clone());
         Ok(x)
     }
+
+    async fn add_repo_key(
+        &self,
+        old: &RepoSource,
+        new_password: &str,
+        allow_write: bool,
+    ) -> RusticResult<()> {
+        let this = self.clone();
+        let old = old.clone();
+        let new_password = new_password.to_string();
+        tokio::task::spawn_blocking(move || {
+            this.add_repo_key_blocking(&old, &new_password, allow_write)
+        })
+        .await
+        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+    }
+
+    async fn remove_old_repo_key(
+        &self,
+        old: &RepoSource,
+        new_password: &str,
+        allow_write: bool,
+    ) -> RusticResult<()> {
+        let this = self.clone();
+        let old = old.clone();
+        let new_password = new_password.to_string();
+        tokio::task::spawn_blocking(move || {
+            this.remove_old_repo_key_blocking(&old, &new_password, allow_write)
+        })
+        .await
+        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,7 +859,6 @@ mod tests {
     fn user_with(points: Vec<VfsPoint>) -> VfsUser {
         VfsUser {
             username: "alice".into(),
-            password_hash: "pw".into(),
             points,
         }
     }
@@ -741,6 +899,23 @@ mod tests {
         op.write("file.txt", b"hi".to_vec()).await.unwrap();
         let data = op.read("file.txt").await.unwrap();
         assert_eq!(data.to_vec(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn remote_data_mount_is_read_only_even_when_writable() {
+        let mgr = manager().await;
+        // "memory" is not a local scheme, so it counts as remote.
+        let point = memory_point("remote", false, None);
+
+        let mount = mgr.mount_operator(&point).unwrap();
+        let err = mount.write("f.txt", b"hi".to_vec()).await.unwrap_err();
+        assert_eq!(err.kind(), opendal_core::ErrorKind::PermissionDenied);
+
+        // ...while the job operator for the same point still accepts writes
+        // (restore into a remote point must keep working).
+        let user = user_with(vec![point.clone()]);
+        let job_op = mgr.point_operator(&user, &point).unwrap();
+        job_op.write("f.txt", b"hi".to_vec()).await.unwrap();
     }
 
     #[tokio::test]

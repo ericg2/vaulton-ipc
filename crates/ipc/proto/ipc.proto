@@ -5,6 +5,9 @@ import "google/protobuf/timestamp.proto";
 
 message RepoSource {
   PointSource src = 1;
+  // Changing this for an existing repo point (same VfsPoint.id, same src) in
+  // SetVfs rotates the key inside the repository: the new password is added
+  // and the old key is removed. The repo must be writable (can_write) for that.
   string password = 2;
 }
 
@@ -18,6 +21,10 @@ message VfsPoint {
   string id = 1;
   string name = 2;
   uint64 max_bytes = 3;
+  // For data points: only local/fs-backed points can ever be written to by a
+  // user through the Vfs_* calls (remote schemes are read-only there, even
+  // when can_write is true). For repo points: gates backup/forget jobs.
+  // Backup and restore jobs themselves still work against remote backends.
   bool can_write = 4;
   oneof src {
     PointSource data = 5;
@@ -42,8 +49,7 @@ message VfsInfo {
 
 message VfsUser {
   string name = 1;
-  string password_hash = 2;
-  repeated VfsPoint points = 3;
+  repeated VfsPoint points = 2;
 }
 
 message FilePath {
@@ -254,6 +260,8 @@ message JobCancelResponse {
 
 ///////////////////////////////////////////////////////////////////
 
+// Replaces the whole configuration. Write-protected remote points and repos
+// are enforced server-side. See RepoSource.password for password changes.
 message SetVfsArgs {
   repeated VfsUser users = 1;
 }
@@ -272,9 +280,9 @@ message ReadVfsResponse {
   bytes data = 1;
 }
 
-// Opens a write handle on `path`. Supported for all backends.
-// For local/fs-backed points, this allows random-access via Vfs_WriteAt.
-// For non-local points, writes via Vfs_WriteAt must be sequential (like a stream).
+// Opens a write handle on `path`. Only local/fs-backed, writable data points
+// support this; any other target (remote backend, repo, read-only point) fails
+// with PERMISSION_DENIED. Writes via Vfs_WriteAt are random-access.
 message OpenWriteArgs {
   FilePath path = 1;
   bool overwrite = 2;
@@ -287,10 +295,8 @@ message OpenWriteResponse {
 }
 
 // Writes `data` at byte offset `offset` into the file behind `handle_id`,
-// as returned by Vfs_OpenWrite. For local backends, writing past the current end
-// of the file extends it (the gap is zero-filled). Writes may be issued in any order.
-// For non-local backends, the offset must match the current file length exactly
-// (strictly sequential writes).
+// as returned by Vfs_OpenWrite. Writing past the current end of the file
+// extends it (the gap is zero-filled). Writes may be issued in any order.
 message WriteAtArgs {
   string handle_id = 1;
   uint64 offset = 2;
@@ -299,13 +305,16 @@ message WriteAtArgs {
 
 // Flushes and closes a handle opened by Vfs_OpenWrite. The handle id is no
 // longer valid after this call. Closing is required for the write to be
-// durable and for the point's quota accounting to see the final file size;
+// durable;
 // closing a handle twice, or one that's already expired/unknown, returns
 // NOT_FOUND.
 message CloseHandleArgs {
   string handle_id = 1;
 }
 
+// Copies or moves a file/dir. The destination must be a writable local data
+// point. The source may be any data point or repo (copy), but a move needs a
+// writable local source since it deletes it.
 message TransferArgs {
   FilePath old_path = 1;
   FilePath new_path = 2;

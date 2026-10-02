@@ -16,7 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -49,31 +49,18 @@ use rustic_core::{
     RestoreOptions, RusticError, SnapshotOptions, StringList,
 };
 
-// ── Unified write handles ──────────────────────────────────────────────
+// ── Write handles ──────────────────────────────────────────────────────
 //
 // Backing state for `Vfs_OpenWrite`/`Vfs_WriteAt`/`Vfs_SetLength`/`Vfs_CloseWrite`.
 //
-// Every handle is backed by a real local file:
-//   * local points: the actual destination file;
-//   * remote points: a temporary *spool* file. OpenDAL has no random-access
-//     write primitive, so the spool is seeded with the existing object (unless
-//     the handle truncates), edited like a normal file (WriteAt/SetLength work),
-//     and streamed up through an OpenDAL writer when the handle is closed.
-
-/// Extra state for handles whose real destination is a remote object.
-struct RemoteSink {
-    op: Operator,
-    path: String,
-    spool_path: PathBuf,
-    /// Only upload on close if something actually changed.
-    dirty: bool,
-}
+// Handles exist only for writable local/fs-backed data points and are backed
+// by the real destination file. Remote backends are not writable by users at
+// all (see `utils::require_user_writable`), so there is no spooling/upload
+// path: remote data is only ever written by backup/restore jobs.
 
 struct WriteState {
-    /// Real local file, or the spool file for remote destinations.
     file: tokio::fs::File,
     len: u64,
-    remote: Option<RemoteSink>,
 }
 
 /// Max buffered events retained for Poll; telemetry is discarded first when saturated.
@@ -84,7 +71,7 @@ const POLL_BATCH: usize = 2_000;
 const HANDLE_IDLE_TTL: Duration = Duration::from_secs(600);
 /// Largest single read served over gRPC (callers must chunk beyond this).
 const MAX_READ: u64 = 32 * 1024 * 1024;
-/// Chunk size for spool downloads/uploads and cross-backend transfers.
+/// Chunk size for cross-backend transfers.
 const SPOOL_CHUNK: u64 = 8 * 1024 * 1024;
 /// How long finished job results stay queryable through `GetJob`.
 const FINISHED_JOB_TTL: Duration = Duration::from_secs(600);
@@ -161,96 +148,10 @@ async fn check_local_quota(
     Ok(())
 }
 
-/// Downloads the existing object into a fresh spool file (unless overwriting).
-/// Returns (file, current_len, dirty).
-async fn open_spool(
-    op: &Operator,
-    path: &str,
-    overwrite: bool,
-    spool_path: &std::path::Path,
-) -> Result<(tokio::fs::File, u64, bool), Status> {
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(spool_path)
-        .await
-        .map_err(io_status)?;
-
-    if overwrite {
-        return Ok((f, 0, true));
-    }
-
-    match op.stat(path).await {
-        Ok(meta) if meta.is_dir() => Err(Status::failed_precondition(
-            "cannot open a directory as a write target",
-        )),
-        Ok(meta) => {
-            let total = meta.content_length();
-            let mut offset = 0u64;
-            while offset < total {
-                let end = (offset + SPOOL_CHUNK).min(total);
-                let bytes = op
-                    .read_with(path)
-                    .range(offset..end)
-                    .await
-                    .map_err(map_dal)?
-                    .to_bytes();
-                if bytes.is_empty() {
-                    break;
-                }
-                f.write_all(&bytes).await.map_err(io_status)?;
-                offset += bytes.len() as u64;
-            }
-            f.flush().await.map_err(io_status)?;
-            Ok((f, offset, false))
-        }
-        // New object: make sure an (empty) object exists after close.
-        Err(e) if e.kind() == DalErrorKind::NotFound => Ok((f, 0, true)),
-        Err(e) => Err(map_dal(e)),
-    }
-}
-
-/// Flushes a handle; for remote handles uploads the spool and deletes it.
+/// Flushes a handle and syncs it to disk.
 async fn finalize_write_state(state: &mut WriteState) -> Result<(), Status> {
     state.file.flush().await.map_err(io_status)?;
-
-    let Some(sink) = state.remote.as_ref() else {
-        return state.file.sync_all().await.map_err(io_status);
-    };
-
-    let result: Result<(), Status> = async {
-        if sink.dirty {
-            if state.len == 0 {
-                sink.op
-                    .write(&sink.path, Buffer::new())
-                    .await
-                    .map_err(map_dal)?;
-            } else {
-                state
-                    .file
-                    .seek(SeekFrom::Start(0))
-                    .await
-                    .map_err(io_status)?;
-                let mut writer = sink.op.writer(&sink.path).await.map_err(map_dal)?;
-                let mut buf = vec![0u8; SPOOL_CHUNK as usize];
-                loop {
-                    let n = state.file.read(&mut buf).await.map_err(io_status)?;
-                    if n == 0 {
-                        break;
-                    }
-                    writer.write(buf[..n].to_vec()).await.map_err(map_dal)?;
-                }
-                writer.close().await.map_err(map_dal)?;
-            }
-        }
-        Ok(())
-    }
-    .await;
-
-    let _ = tokio::fs::remove_file(&sink.spool_path).await;
-    result
+    state.file.sync_all().await.map_err(io_status)
 }
 
 /// Deletes a file or directory tree and verifies it is really gone.
@@ -383,7 +284,6 @@ impl TryFrom<ProtoVfsUser> for VfsUser {
     fn try_from(p: ProtoVfsUser) -> Result<Self, Status> {
         Ok(VfsUser {
             username: p.name,
-            password_hash: p.password_hash,
             points: p
                 .points
                 .into_iter()
@@ -634,7 +534,8 @@ struct TransferPlan {
     copy: bool,
     /// Same backend *and* same mount: native copy/rename are usable.
     native: bool,
-    /// (point root, destination file path, quota) for local destinations.
+    /// (point root, destination file path, quota) for the (always local)
+    /// destination; `None` when the transfer can't add bytes to it.
     local_quota: Option<(PathBuf, PathBuf, Option<u64>)>,
 }
 
@@ -797,7 +698,7 @@ async fn copy_tree(
 /// The body of a `Vfs_Transfer` job.
 async fn run_transfer(
     plan: TransferPlan,
-    point_lock: Option<Arc<TokioMutex<()>>>,
+    point_lock: Arc<TokioMutex<()>>,
     job_id: Uuid,
     tx: chan::Sender<Data>,
     token: CancelToken,
@@ -807,10 +708,7 @@ async fn run_transfer(
     // may have changed the point between job creation and execution). The lock
     // is only held for the check so long transfers don't block new writes.
     if let Some((root, full_path, max)) = plan.local_quota.as_ref() {
-        let _guard = match &point_lock {
-            Some(lock) => Some(lock.clone().lock_owned().await),
-            None => None,
-        };
+        let _guard = point_lock.lock_owned().await;
 
         let existing_len = tokio::fs::metadata(full_path)
             .await
@@ -890,6 +788,17 @@ async fn run_transfer(
     report(None);
 
     Ok(None)
+}
+
+/// A pending repository password change detected by `set_vfs`.
+struct RepoPasswordChange {
+    user: String,
+    point: String,
+    /// Storage target plus the *old* password.
+    old_src: RepoSource,
+    new_password: String,
+    /// Whether the repo point is writable (key rotation writes to the repo).
+    allow_write: bool,
 }
 
 // ── Server state ──────────────────────────────────────────────────────────────
@@ -1113,6 +1022,16 @@ where
         for handle in handles {
             Self::close_write_handle(handle).await;
         }
+    }
+
+    /// Rejects `file` unless a user may modify it: only writable local/fs
+    /// data points qualify (remote points and repos are read-only; see
+    /// `utils::require_user_writable`).
+    async fn require_user_write(&self, file: &FilePath) -> Result<(), Status> {
+        let user = self.get_user(&file.user).await?;
+        let vfs_path = resolve_file_path(&user, file)?;
+        let (point, _) = utils::resolve_point_path(&user, &vfs_path)?;
+        utils::require_user_writable(point)
     }
 
     /// Attempts to resolve the [`Operator`] and normalized path string for a
@@ -1751,6 +1670,74 @@ where
         let mut changed_users = Vec::new();
         let mut removed_quotas = Vec::new();
 
+        // Repo points that keep their ID and storage target but get a new
+        // password: the password has to be changed *inside* the repository
+        // too, or the point would fail to open with the new one.
+        let mut password_changes: Vec<RepoPasswordChange> = Vec::new();
+        for old_user in &old_users {
+            let Some(new_user) = users.iter().find(|u| u.username == old_user.username) else {
+                continue;
+            };
+            for old_point in old_user.points.iter().filter(|p| p.is_repo) {
+                let Some(new_point) = new_user
+                    .points
+                    .iter()
+                    .find(|p| p.id == old_point.id && p.is_repo)
+                else {
+                    continue;
+                };
+                let (Some(old_pw), Some(new_pw)) =
+                    (&old_point.repo_password, &new_point.repo_password)
+                else {
+                    continue;
+                };
+                if old_pw == new_pw {
+                    continue;
+                }
+                if old_point.scheme != new_point.scheme || old_point.config != new_point.config {
+                    warn!(
+                        "SetVfs: repo point '{}' of user '{}' changed password AND storage target; \
+                         treating it as a different repository (no key rotation)",
+                        new_point.name, new_user.username
+                    );
+                    continue;
+                }
+                warn!(
+                    "SetVfs: repository password of point '{}' (user '{}') changed; \
+                     rotating the key inside the repository",
+                    new_point.name, new_user.username
+                );
+                password_changes.push(RepoPasswordChange {
+                    user: new_user.username.clone(),
+                    point: new_point.name.clone(),
+                    old_src: RepoSource {
+                        scheme: old_point.scheme.clone(),
+                        config: old_point.config.clone(),
+                        password: old_pw.clone(),
+                    },
+                    new_password: new_pw.clone(),
+                    allow_write: !new_point.read_only,
+                });
+            }
+        }
+
+        // Phase 1: add the new key to every affected repo while the old one
+        // still works. If anything fails, the request is rejected and the
+        // stored configuration is untouched (a harmless extra key may remain
+        // in repos that were already processed; the old password still works).
+        for change in &password_changes {
+            self.inner
+                .storage
+                .add_repo_key(&change.old_src, &change.new_password, change.allow_write)
+                .await
+                .map_err(|e| {
+                    Status::failed_precondition(format!(
+                        "failed to change the repository password of point '{}' (user '{}'): {e}",
+                        change.point, change.user
+                    ))
+                })?;
+        }
+
         for old_user in &old_users {
             let new_user = users.iter().find(|user| user.username == old_user.username);
 
@@ -1830,6 +1817,23 @@ where
             }
         }
 
+        // Phase 2: the new password is persisted, so drop the old key. A
+        // failure here only leaves the old password valid in the repo.
+        for change in &password_changes {
+            if let Err(e) = self
+                .inner
+                .storage
+                .remove_old_repo_key(&change.old_src, &change.new_password, change.allow_write)
+                .await
+            {
+                warn!(
+                    "SetVfs: new password for repo point '{}' (user '{}') is active, but removing \
+                     the old key failed (the old password still works): {e}",
+                    change.point, change.user
+                );
+            }
+        }
+
         Ok(Response::new(Empty {}))
     }
 
@@ -1888,10 +1892,11 @@ where
         }))
     }
 
-    // ── Write handles (random access; remote points are spooled) ──────────
+    // ── Write operations (writable local points only) ─────────────────────
 
     async fn vfs_touch_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
+        self.require_user_write(&args).await?;
         let (op, path) = self.get_operator(&args, false).await?;
         op.write(&path, Buffer::new()).await.map_err(map_dal)?;
         Ok(Response::new(Empty {}))
@@ -1906,129 +1911,88 @@ where
         let user = self.get_user(&file.user).await?;
         let path_str = resolve_file_path(&user, file)?;
 
-        let (point, rest) = utils::resolve_data_path(&user, &path_str)?;
-        utils::require_writable(point)?;
+        let (point, rest) = utils::resolve_point_path(&user, &path_str)?;
+        utils::require_user_writable(point)?;
 
         let handle_id = Uuid::new_v4();
 
-        let handle = if utils::is_local_scheme(&point.scheme) {
-            // Only held while opening; NOT for the life of the handle, or a
-            // second open / set_length / transfer on this point would deadlock.
-            let lock = self
-                .inner
-                .local_point_locks
-                .entry(point.id)
-                .or_insert_with(|| Arc::new(TokioMutex::new(())))
-                .clone();
-            let _guard = lock.lock_owned().await;
+        // Only held while opening; NOT for the life of the handle, or a
+        // second open / set_length / transfer on this point would deadlock.
+        let lock = self
+            .inner
+            .local_point_locks
+            .entry(point.id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone();
+        let _guard = lock.lock_owned().await;
 
-            let root = PathBuf::from(utils::local_source_path(point)?);
-            let full_path = utils::safe_join(&root, &rest.to_string_lossy())?;
+        let root = PathBuf::from(utils::local_source_path(point)?);
+        let full_path = utils::safe_join(&root, &rest.to_string_lossy())?;
 
-            if let Some(parent) = full_path.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(io_status)?;
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(io_status)?;
+        }
+
+        let existing_len = match tokio::fs::metadata(&full_path).await {
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(_) => {
+                return Err(Status::failed_precondition(
+                    "cannot open a directory as a write target",
+                ));
             }
-
-            let existing_len = match tokio::fs::metadata(&full_path).await {
-                Ok(meta) if meta.is_file() => meta.len(),
-                Ok(_) => {
-                    return Err(Status::failed_precondition(
-                        "cannot open a directory as a write target",
-                    ));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-                Err(e) => return Err(io_status(e)),
-            };
-            let initial_len = if args.overwrite { 0 } else { existing_len };
-
-            // Only walk the tree when a quota actually exists.
-            let quota_base_bytes = if let Some(max) = point.max_bytes {
-                let root_for_scan = root.clone();
-                let total_used =
-                    tokio::task::spawn_blocking(move || utils::dir_size(&root_for_scan))
-                        .await
-                        .map_err(|e| Status::internal(format!("quota check panicked: {e}")))?
-                        .map_err(|e| {
-                            Status::internal(format!("failed to measure quota usage: {e}"))
-                        })?;
-                let base = total_used.saturating_sub(existing_len);
-                if base
-                    .checked_add(initial_len)
-                    .ok_or_else(|| Status::resource_exhausted("quota size overflow"))?
-                    > max
-                {
-                    return Err(Status::resource_exhausted(format!(
-                        "point '{}' is already over its {max}-byte quota",
-                        point.name
-                    )));
-                }
-                base
-            } else {
-                0
-            };
-
-            let f = tokio::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .open(&full_path)
-                .await
-                .map_err(io_status)?;
-
-            if args.overwrite {
-                f.set_len(0).await.map_err(io_status)?;
-            }
-
-            Arc::new(ActiveWriteHandle {
-                last_used: StdMutex::new(Instant::now()),
-                state: TokioMutex::new(WriteState {
-                    file: f,
-                    len: initial_len,
-                    remote: None,
-                }),
-                max_bytes: point.max_bytes,
-                quota_base_bytes,
-                point_id: point.id,
-                username: user.username.clone(),
-                append: args.append,
-                expired: AtomicBool::new(false),
-            })
-        } else {
-            // Remote: spool to a local temp file, upload on close.
-            let (op, file_path) = self.get_operator(file, false).await?;
-            let spool_path = std::env::temp_dir().join(format!("vfs-spool-{handle_id}"));
-
-            let (f, len, dirty) =
-                match open_spool(&op, &file_path, args.overwrite, &spool_path).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tokio::fs::remove_file(&spool_path).await;
-                        return Err(e);
-                    }
-                };
-
-            Arc::new(ActiveWriteHandle {
-                last_used: StdMutex::new(Instant::now()),
-                state: TokioMutex::new(WriteState {
-                    file: f,
-                    len,
-                    remote: Some(RemoteSink {
-                        op,
-                        path: file_path,
-                        spool_path,
-                        dirty,
-                    }),
-                }),
-                // Per-file guard so a runaway write can't fill the temp disk;
-                // point-wide remote quota is still enforced by the OpenDAL layer.
-                max_bytes: point.max_bytes,
-                quota_base_bytes: 0,
-                point_id: point.id,
-                username: user.username.clone(),
-                append: args.append,
-                expired: AtomicBool::new(false),
-            })
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(io_status(e)),
         };
+        let initial_len = if args.overwrite { 0 } else { existing_len };
+
+        // Only walk the tree when a quota actually exists.
+        let quota_base_bytes = if let Some(max) = point.max_bytes {
+            let root_for_scan = root.clone();
+            let total_used = tokio::task::spawn_blocking(move || utils::dir_size(&root_for_scan))
+                .await
+                .map_err(|e| Status::internal(format!("quota check panicked: {e}")))?
+                .map_err(|e| Status::internal(format!("failed to measure quota usage: {e}")))?;
+            let base = total_used.saturating_sub(existing_len);
+            if base
+                .checked_add(initial_len)
+                .ok_or_else(|| Status::resource_exhausted("quota size overflow"))?
+                > max
+            {
+                return Err(Status::resource_exhausted(format!(
+                    "point '{}' is already over its {max}-byte quota",
+                    point.name
+                )));
+            }
+            base
+        } else {
+            0
+        };
+
+        let f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&full_path)
+            .await
+            .map_err(io_status)?;
+
+        if args.overwrite {
+            f.set_len(0).await.map_err(io_status)?;
+        }
+
+        let handle = Arc::new(ActiveWriteHandle {
+            last_used: StdMutex::new(Instant::now()),
+            state: TokioMutex::new(WriteState {
+                file: f,
+                len: initial_len,
+            }),
+            max_bytes: point.max_bytes,
+            quota_base_bytes,
+            point_id: point.id,
+            username: user.username.clone(),
+            append: args.append,
+            expired: AtomicBool::new(false),
+        });
 
         self.inner.write_handles.insert(handle_id, handle);
 
@@ -2059,7 +2023,7 @@ where
         if handle.expired.load(Ordering::Acquire) {
             return Err(Status::not_found("write handle closed"));
         }
-        let WriteState { file, len, remote } = &mut *state;
+        let WriteState { file, len } = &mut *state;
 
         // In append mode the caller's offset is ignored entirely — always
         // write at the current end of the file.
@@ -2097,9 +2061,6 @@ where
         file.flush().await.map_err(io_status)?;
 
         *len = new_len;
-        if let Some(r) = remote {
-            r.dirty = true;
-        }
 
         Ok(Response::new(Empty {}))
     }
@@ -2139,6 +2100,7 @@ where
 
     async fn vfs_create_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
+        self.require_user_write(&args).await?;
         let (op, path) = self.get_operator(&args, true).await?;
         info!("Attempting to create {}", &path);
         op.create_dir(&path).await.map_err(map_dal)?;
@@ -2146,6 +2108,7 @@ where
     }
     async fn vfs_remove_file(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
+        self.require_user_write(&args).await?;
         let (op, path) = self.get_operator(&args, false).await?;
         info!("Attempting to remove {}", &path);
         remove_any(&op, &path).await?;
@@ -2154,6 +2117,7 @@ where
 
     async fn vfs_remove_dir(&self, request: Request<FilePath>) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
+        self.require_user_write(&args).await?;
         let (op, path) = self.get_operator(&args, false).await?;
         info!("Attempting to remove {}", &path);
         remove_any(&op, &path).await?;
@@ -2166,9 +2130,8 @@ where
     ) -> Result<Response<Empty>, Status> {
         let args = request.into_inner();
 
-        // Preferred path: resize an open write handle. Works for local files
-        // and for remote spool files alike, and never contends on the point
-        // lock (the handle already owns its file).
+        // Preferred path: resize an open write handle. Never contends on the
+        // point lock (the handle already owns its file).
         if !args.handle_id.is_empty() {
             let handle_id = parse_handle_id(&args.handle_id)?;
             let handle = self
@@ -2191,31 +2154,19 @@ where
             }
             state.file.set_len(args.length).await.map_err(io_status)?;
             state.len = args.length;
-            if let Some(r) = state.remote.as_mut() {
-                r.dirty = true;
-            }
             if let Ok(mut t) = handle.last_used.lock() {
                 *t = Instant::now();
             }
             return Ok(Response::new(Empty {}));
         }
 
-        // Fallback: path-based resize, local writable points only.
+        // Fallback: path-based resize (writable local points only).
         let file = require_path(&args.path)?;
         let user = self.get_user(&file.user).await?;
         let vfs_path = resolve_file_path(&user, file)?;
 
-        let (point, rest) = utils::resolve_data_path(&user, &vfs_path)?;
-        utils::require_writable(point)?;
-
-        // OpenDAL does not provide a portable random-access truncate/resize
-        // primitive, so without a handle only local points are supported.
-        if !utils::is_local_scheme(&point.scheme) {
-            return Err(Status::unimplemented(
-                "path-based set_length is only supported for local writable points; \
-                 pass the handle_id of an open write handle for remote points",
-            ));
-        }
+        let (point, rest) = utils::resolve_point_path(&user, &vfs_path)?;
+        utils::require_user_writable(point)?;
 
         let lock = self
             .inner
@@ -2363,21 +2314,23 @@ where
         let src_path_for_point = resolve_file_path(&src_user, old_file)?;
         let dst_path_for_point = resolve_file_path(&dst_user, new_file)?;
 
-        // The source may be a data point or a repo point (copying a file out
-        // of a repository snapshot is fine); the destination must be a
-        // writable data point.
+        // The source may be any data point (local or remote) or a repo point
+        // (copying a file out of a repository snapshot is fine); the
+        // destination must be a user-writable (local, writable) data point.
         let (src_point, _) = utils::resolve_point_path(&src_user, &src_path_for_point)?;
-        let (dst_point, dst_rest) = utils::resolve_data_path(&dst_user, &dst_path_for_point)?;
+        let (dst_point, dst_rest) = utils::resolve_point_path(&dst_user, &dst_path_for_point)?;
 
-        utils::require_writable(dst_point)?;
+        utils::require_user_writable(dst_point)?;
         if !args.copy {
-            // A move deletes the source, so it needs a writable data source.
+            // A move deletes the source, so it needs a user-writable source.
             if src_point.is_repo {
                 return Err(Status::permission_denied(
                     "cannot move out of a repository; use copy instead",
                 ));
             }
-            utils::require_writable(src_point)?;
+            utils::require_user_writable(src_point).map_err(|e| {
+                Status::permission_denied(format!("cannot move out of this point ({}); use copy instead", e.message()))
+            })?;
         }
 
         let (src_op, src_path) = self.get_operator(old_file, false).await?;
@@ -2464,22 +2417,16 @@ where
         // so skip the check there. Copies, and moves between points, add bytes.
         let needs_quota_check = copy || !same_mount;
 
-        let (local_quota, point_lock) = if utils::is_local_scheme(&dst_point.scheme) {
-            let root = PathBuf::from(utils::local_source_path(dst_point)?);
-            let full_path = utils::safe_join(&root, &dst_rest.to_string_lossy())?;
-            let lock = self
-                .inner
-                .local_point_locks
-                .entry(dst_point.id)
-                .or_insert_with(|| Arc::new(TokioMutex::new(())))
-                .clone();
-            (
-                needs_quota_check.then_some((root, full_path, dst_point.max_bytes)),
-                Some(lock),
-            )
-        } else {
-            (None, None)
-        };
+        // The destination is guaranteed local by `require_user_writable`.
+        let root = PathBuf::from(utils::local_source_path(dst_point)?);
+        let full_path = utils::safe_join(&root, &dst_rest.to_string_lossy())?;
+        let point_lock = self
+            .inner
+            .local_point_locks
+            .entry(dst_point.id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone();
+        let local_quota = needs_quota_check.then_some((root, full_path, dst_point.max_bytes));
 
         let plan = TransferPlan {
             src_op,
