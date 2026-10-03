@@ -4,7 +4,7 @@ use crossbeam_channel as chan;
 use dashmap::DashMap;
 use futures_lite::StreamExt;
 use log::{error, info, warn};
-use opendal_core::{Buffer, ErrorKind as DalErrorKind, Metadata, Operator};
+use opendal_core::{Buffer, ErrorKind as DalErrorKind, Metadata, Operator, Reader};
 use rustic_backend::local::LocalSource;
 use rustic_backend::opendal::OpenDALSource;
 use std::collections::{HashSet, VecDeque};
@@ -16,7 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -69,6 +69,16 @@ const MAX_EVENTS: usize = 10_000;
 const POLL_BATCH: usize = 2_000;
 /// Write handles idle longer than this are closed by the reaper.
 const HANDLE_IDLE_TTL: Duration = Duration::from_secs(600);
+/// Read handles are deliberately a little shorter-lived than write handles:
+/// they retain an open local file descriptor or an OpenDAL Reader, but are
+/// recreated transparently when idle.
+const READ_HANDLE_IDLE_TTL: Duration = Duration::from_secs(120);
+/// OpenDAL read-ahead chunk size for remote readers.
+const READ_CHUNK: usize = 1024 * 1024;
+/// Number of backend requests OpenDAL may issue concurrently for a read.
+const READ_CONCURRENT: usize = 8;
+/// Small-gap merge window for adjacent/random-access SMB reads.
+const READ_GAP: usize = 256 * 1024;
 /// Largest single read served over gRPC (callers must chunk beyond this).
 const MAX_READ: u64 = 32 * 1024 * 1024;
 /// Chunk size for cross-backend transfers.
@@ -86,9 +96,38 @@ struct ActiveWriteHandle {
     #[allow(dead_code)]
     point_id: Uuid,
     username: String,
+    path: String,
     /// When true, every `Vfs_WriteAt` ignores the caller's `offset` and
     /// writes at the current end of the file.
     append: bool,
+    expired: AtomicBool,
+}
+
+/// A persistent read handle for one VFS file.
+///
+/// Remote files keep an OpenDAL `Reader` alive.  OpenDAL's range-based Reader
+/// is stateless at the public API, so multiple gRPC reads can use the same
+/// reader concurrently without a seek/mutex bottleneck.  The reader is opened
+/// with chunking/concurrency/gap-merging tuned for random-access clients such
+/// as Windows Explorer.
+///
+/// Local files keep one opened Tokio file handle.  Each request clones the
+/// underlying OS handle before seeking, so concurrent reads never race on a
+/// shared file cursor.
+enum ReadState {
+    Local(tokio::fs::File),
+    Remote(Reader),
+}
+
+struct ActiveReadHandle {
+    last_used: StdMutex<Instant>,
+    state: ReadState,
+    username: String,
+    #[allow(dead_code)]
+    point_id: Uuid,
+    #[allow(dead_code)]
+    path: String,
+    len: u64,
     expired: AtomicBool,
 }
 
@@ -828,6 +867,10 @@ where
     /// caller. Entries live here for the lifetime of the handle and are
     /// removed by `Vfs_CloseWrite`.
     write_handles: DashMap<Uuid, Arc<ActiveWriteHandle>>,
+    /// Read handles are keyed by `(username, normalized VFS path)`.  The public
+    /// ReadVfs RPC remains path/offset/length based; the handle is an internal
+    /// optimization so callers do not need a new RPC or handle ID.
+    read_handles: DashMap<String, Arc<ActiveReadHandle>>,
     local_point_locks: DashMap<Uuid, Arc<TokioMutex<()>>>,
     snapshot_cache: Cache<RepoSource, Arc<Vec<Snapshot>>>,
     /// Global event sink: logs, point status and every job's progress.
@@ -881,6 +924,7 @@ where
                     .build(),
                 events: StdMutex::new(VecDeque::new()),
                 write_handles: DashMap::new(),
+                read_handles: DashMap::new(),
                 local_point_locks: DashMap::new(),
                 snapshot_cache: Cache::builder()
                     .time_to_live(Duration::from_secs(5))
@@ -977,6 +1021,38 @@ where
             }
         });
 
+        // Reaper for idle read handles.  Reads have no explicit close RPC, so
+        // the TTL is what bounds open descriptors and remote reader state.
+        let weak = Arc::downgrade(&server.inner);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let Some(inner) = weak.upgrade() else { break };
+
+                let expired: Vec<String> = inner
+                    .read_handles
+                    .iter()
+                    .filter_map(|entry| {
+                        let idle = entry
+                            .value()
+                            .last_used
+                            .lock()
+                            .map(|t| t.elapsed())
+                            .unwrap_or_default();
+                        (idle > READ_HANDLE_IDLE_TTL).then_some(entry.key().clone())
+                    })
+                    .collect();
+
+                for key in expired {
+                    if let Some((_, handle)) = inner.read_handles.remove(&key) {
+                        handle.expired.store(true, Ordering::Release);
+                        // Dropping the Arc closes the local descriptor / reader.
+                    }
+                }
+            }
+        });
+
         server
     }
 
@@ -1003,6 +1079,28 @@ where
         }
     }
 
+    fn invalidate_user_read_handles(&self, username: &str) {
+        let keys: Vec<String> = self
+            .inner
+            .read_handles
+            .iter()
+            .filter_map(|entry| (entry.value().username == username).then_some(entry.key().clone()))
+            .collect();
+
+        for key in keys {
+            if let Some((_, handle)) = self.inner.read_handles.remove(&key) {
+                handle.expired.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn invalidate_read_handle(&self, username: &str, vfs_path: &str) {
+        let key = format!("{}\0{}", username, vfs_path);
+        if let Some((_, handle)) = self.inner.read_handles.remove(&key) {
+            handle.expired.store(true, Ordering::Release);
+        }
+    }
+
     /// Cancels active jobs and closes all write handles during process shutdown.
     /// This prevents detached rustic work or open local files from surviving
     /// after the network listeners have stopped accepting new requests.
@@ -1021,6 +1119,144 @@ where
 
         for handle in handles {
             Self::close_write_handle(handle).await;
+        }
+
+        for entry in self.inner.read_handles.iter() {
+            entry.value().expired.store(true, Ordering::Release);
+        }
+        self.inner.read_handles.clear();
+    }
+
+    /// Gets or opens the internal read handle for `file`.
+    ///
+    /// This is intentionally transparent to the protobuf API: callers still
+    /// provide only `path`, `offset`, and `length`.  The server reuses the
+    /// reader while it is hot and drops it after the read-handle TTL.
+    async fn get_read_handle(&self, file: &FilePath) -> Result<Arc<ActiveReadHandle>, Status> {
+        let user = self.get_user(&file.user).await?;
+        let vfs_path = resolve_file_path(&user, file)?;
+        let (point, rest) = utils::resolve_point_path(&user, &vfs_path)?;
+        let key = format!("{}\0{}", user.username, vfs_path);
+
+        if let Some(existing) = self.inner.read_handles.get(&key) {
+            let handle = Arc::clone(&*existing);
+            drop(existing);
+
+            if !handle.expired.load(Ordering::Acquire) {
+                if let Ok(mut t) = handle.last_used.lock() {
+                    *t = Instant::now();
+                }
+                return Ok(handle);
+            }
+
+            self.inner.read_handles.remove(&key);
+        }
+
+        let handle = if utils::is_local_scheme(&point.scheme) && !point.is_repo {
+            let root = PathBuf::from(utils::local_source_path(point)?);
+            let full_path = utils::safe_join(&root, &rest.to_string_lossy())?;
+            let metadata = tokio::fs::metadata(&full_path).await.map_err(io_status)?;
+
+            if !metadata.is_file() {
+                return Err(Status::failed_precondition(
+                    "cannot read a directory as a file",
+                ));
+            }
+
+            let file = tokio::fs::OpenOptions::new()
+                .read(true)
+                .open(&full_path)
+                .await
+                .map_err(io_status)?;
+
+            Arc::new(ActiveReadHandle {
+                last_used: StdMutex::new(Instant::now()),
+                state: ReadState::Local(file),
+                username: user.username.clone(),
+                point_id: point.id,
+                path: vfs_path,
+                len: metadata.len(),
+                expired: AtomicBool::new(false),
+            })
+        } else {
+            let op = self.inner.storage.get_vfs(&user).await.map_err(map_vfs)?;
+            self.check_point_loaded(&user, &vfs_path)?;
+
+            // OpenDAL's Reader is range based.  Keep it open between gRPC
+            // reads and let OpenDAL split each requested range into 1 MiB
+            // backend requests, with up to 8 in flight.  A small gap merge is
+            // useful for SMB/Explorer's nearby 1 MiB reads without turning
+            // unrelated random reads into giant requests.
+            let path = fix_path(vfs_path.clone(), false);
+            let reader = op
+                .reader_with(&path)
+                .chunk(READ_CHUNK)
+                .concurrent(READ_CONCURRENT)
+                .gap(READ_GAP)
+                .await
+                .map_err(map_dal)?;
+
+            warn!("DOING STAT FOR HANDLE");
+            let len = op.stat(&path).await.map_err(map_dal)?.content_length();
+
+            Arc::new(ActiveReadHandle {
+                last_used: StdMutex::new(Instant::now()),
+                state: ReadState::Remote(reader),
+                username: user.username.clone(),
+                point_id: point.id,
+                path: vfs_path,
+                len,
+                expired: AtomicBool::new(false),
+            })
+        };
+
+        // Another request may have won the race while we opened the reader.
+        // Prefer the already-live handle so only one backend reader is retained.
+        if let Some(existing) = self
+            .inner
+            .read_handles
+            .insert(key.clone(), Arc::clone(&handle))
+        {
+            if !existing.expired.load(Ordering::Acquire) {
+                return Ok(existing);
+            }
+        }
+
+        Ok(handle)
+    }
+
+    async fn read_from_handle(
+        handle: &ActiveReadHandle,
+        offset: u64,
+        length: u64,
+    ) -> Result<Buffer, Status> {
+        if handle.expired.load(Ordering::Acquire) {
+            return Err(Status::not_found("read handle expired"));
+        }
+
+        if offset >= handle.len || length == 0 {
+            return Ok(Buffer::new());
+        }
+
+        let length = length.min(handle.len - offset);
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| Status::invalid_argument("read range overflow"))?;
+
+        match &handle.state {
+            ReadState::Remote(reader) => reader.read(offset..end).await.map_err(map_dal),
+            ReadState::Local(file) => {
+                // Clone the OS file handle rather than sharing a seek cursor.
+                // Windows Explorer can issue overlapping reads concurrently.
+                let mut f = file.try_clone().await.map_err(io_status)?;
+                f.seek(SeekFrom::Start(offset)).await.map_err(io_status)?;
+
+                let mut out = Vec::with_capacity(length as usize);
+                let mut limited = f.take(length);
+                limited.read_to_end(&mut out).await.map_err(io_status)?;
+
+                Ok(Buffer::from(out))
+            }
         }
     }
 
@@ -1806,6 +2042,7 @@ where
                 &user.username
             );
             self.invalidate_user_write_handles(&user.username);
+            self.invalidate_user_read_handles(&user.username);
             self.inner.storage.invalidate_vfs(&user);
         }
 
@@ -1859,33 +2096,46 @@ where
         request: Request<ReadVfsArgs>,
     ) -> Result<Response<ReadVfsResponse>, Status> {
         let args = request.into_inner();
-        let file = require_path(&args.path)?;
-        let (op, path) = self.get_operator(file, false).await?;
+
         if args.length > MAX_READ {
             return Err(Status::invalid_argument(format!(
                 "length exceeds {MAX_READ} bytes; read in chunks"
             )));
         }
-        let buf = if args.length == 0 {
-            let size = op.stat(&path).await.map_err(map_dal)?.content_length();
-            if size > MAX_READ {
+
+        let file = require_path(&args.path)?;
+        let handle = self.get_read_handle(file).await?;
+
+        if handle.expired.load(Ordering::Acquire) {
+            return Err(Status::not_found("read handle expired"));
+        }
+
+        if let Ok(mut t) = handle.last_used.lock() {
+            *t = Instant::now();
+        }
+
+        // length == 0 preserves the existing public semantics: read the whole
+        // file, provided it fits inside the RPC limit.
+        let (read_offset, length) = if args.length == 0 {
+            if handle.len > MAX_READ {
                 return Err(Status::invalid_argument(format!(
-                    "file is {size} bytes; use offset/length to read in chunks of <= {MAX_READ}"
+                    "file is {} bytes; use offset/length to read in chunks of <= {MAX_READ}",
+                    handle.len
                 )));
             }
-            op.read(&path).await.map_err(map_dal)?
+            // Preserve the existing RPC contract: length == 0 means the
+            // complete file, and the legacy implementation ignored offset in
+            // that mode.
+            (0, handle.len)
         } else {
-            let end = args
-                .offset
-                .checked_add(args.length)
-                .ok_or_else(|| Status::invalid_argument("read range overflow"))?;
-            match op.read_with(&path).range(args.offset..end).await {
-                Ok(b) => b,
-                // Reading at/after EOF yields no data rather than an error.
-                Err(e) if e.kind() == DalErrorKind::RangeNotSatisfied => Buffer::new(),
-                Err(e) => return Err(map_dal(e)),
-            }
+            (args.offset, args.length)
         };
+
+        let buf = Self::read_from_handle(&handle, read_offset, length).await?;
+
+        if let Ok(mut t) = handle.last_used.lock() {
+            *t = Instant::now();
+        }
 
         Ok(Response::new(ReadVfsResponse {
             data: buf.to_bytes().to_vec(),
@@ -1913,6 +2163,10 @@ where
 
         let (point, rest) = utils::resolve_point_path(&user, &path_str)?;
         utils::require_user_writable(point)?;
+
+        // A writer invalidates any cached reader for the same path so a
+        // subsequent read cannot observe a stale length/object version.
+        self.invalidate_read_handle(&user.username, &path_str);
 
         let handle_id = Uuid::new_v4();
 
@@ -1990,6 +2244,7 @@ where
             quota_base_bytes,
             point_id: point.id,
             username: user.username.clone(),
+            path: path_str.clone(),
             append: args.append,
             expired: AtomicBool::new(false),
         });
@@ -2015,6 +2270,12 @@ where
         if handle.expired.load(Ordering::Acquire) {
             return Err(Status::not_found("write handle expired"));
         }
+
+        // Any write invalidates the cached read handle for this path. The next
+        // read will reopen the local file/OpenDAL reader and observe new size
+        // or object contents.
+        self.invalidate_read_handle(&handle.username, &handle.path);
+
         if let Ok(mut t) = handle.last_used.lock() {
             *t = Instant::now();
         }
@@ -2145,6 +2406,7 @@ where
             if handle.expired.load(Ordering::Acquire) {
                 return Err(Status::not_found("write handle closed"));
             }
+            self.invalidate_read_handle(&handle.username, &handle.path);
             if let Some(max) = handle.max_bytes {
                 if handle.quota_base_bytes.saturating_add(args.length) > max {
                     return Err(Status::resource_exhausted(
@@ -2167,6 +2429,7 @@ where
 
         let (point, rest) = utils::resolve_point_path(&user, &vfs_path)?;
         utils::require_user_writable(point)?;
+        self.invalidate_read_handle(&user.username, &vfs_path);
 
         let lock = self
             .inner
@@ -2218,6 +2481,7 @@ where
         // fall back to the directory form on NotFound before giving up.
         let (op, file_path) = self.get_operator(&args, false).await?;
 
+        error!("CALLING R-STAT FOR VFS");
         let meta = match op.stat(&file_path).await {
             Ok(meta) => meta,
             Err(e) if e.kind() == DalErrorKind::NotFound => {
@@ -2329,7 +2593,10 @@ where
                 ));
             }
             utils::require_user_writable(src_point).map_err(|e| {
-                Status::permission_denied(format!("cannot move out of this point ({}); use copy instead", e.message()))
+                Status::permission_denied(format!(
+                    "cannot move out of this point ({}); use copy instead",
+                    e.message()
+                ))
             })?;
         }
 

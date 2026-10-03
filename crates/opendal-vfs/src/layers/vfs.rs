@@ -13,11 +13,10 @@ use log::debug;
 use crate::layers::quota::*;
 use crate::layers::read_only::*;
 
-use crate::cache::{CacheConfig, MountCache};
 use crate::deleter::MountDeleter;
 use crate::lister::MountLister;
 use crate::reader::MountReader;
-use crate::writer::{MountWriter, open_writer};
+use crate::writer::MountWriter;
 
 use opendal_core::raw::oio::OneShotCopier;
 use opendal_core::raw::*;
@@ -53,7 +52,6 @@ pub enum VfsQuota {
 pub struct VfsBuilder {
     state: QuotaState,
     pending: Vec<PendingMount>,
-    cache: CacheConfig,
 }
 
 impl Default for VfsBuilder {
@@ -61,7 +59,6 @@ impl Default for VfsBuilder {
         Self {
             state: QuotaState::new_owned(MemoryTracker::default()),
             pending: Vec::new(),
-            cache: CacheConfig::default(),
         }
     }
 }
@@ -89,7 +86,6 @@ impl Builder for VfsBuilder {
             }
 
             let mut op = pending.operator;
-            let scheme = op.info().scheme();
 
             if let VfsQuota::Enabled { id, bytes } = &pending.quota {
                 op = op.layer(QuotaLayer::new(self.state.clone(), id.clone(), *bytes));
@@ -105,7 +101,6 @@ impl Builder for VfsBuilder {
                     Mount {
                         operator: op,
                         read_only: pending.read_only,
-                        cache: MountCache::new(self.cache.clone(), scheme),
                     },
                 )
                 .is_some()
@@ -127,15 +122,7 @@ impl VfsBuilder {
         Self {
             state,
             pending: Vec::new(),
-            cache: CacheConfig::default(),
         }
-    }
-
-    /// Override the per-mount stat / read-block cache configuration. Use
-    /// [`CacheConfig::disabled`] to turn caching off.
-    pub fn with_cache_config(mut self, cache: CacheConfig) -> Self {
-        self.cache = cache;
-        self
     }
 
     /// Override the [`QuotaTracker`].
@@ -182,19 +169,10 @@ impl VfsBuilder {
 // Mount table
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Mount {
     pub operator: Operator,
     pub read_only: bool,
-    /// Stat / read-block cache for this mount.
-    pub cache: MountCache,
-}
-
-impl Mount {
-    /// Cached (and retried, request-coalesced) `stat` of `rel`.
-    pub(crate) async fn stat(&self, rel: &str) -> Result<Metadata> {
-        self.cache.stat(&self.operator, rel).await
-    }
 }
 /// True if `path` is a virtual ancestor directory of at least one mount.
 fn virtual_children(mounts: &BTreeMap<String, Mount>, path: &str) -> Option<Vec<String>> {
@@ -231,34 +209,6 @@ fn virtual_children(mounts: &BTreeMap<String, Mount>, path: &str) -> Option<Vec<
     }
 }
 
-/// Copy `from_rel` on `from` to `to_rel` on `to` by streaming bounded ranges
-/// (never holds more than one chunk in memory, unlike `read` + `write`).
-async fn stream_copy(from: &Mount, from_rel: &str, to: &Mount, to_rel: &str) -> Result<()> {
-    const CHUNK: u64 = 8 * 1024 * 1024;
-
-    let len = from.operator.stat(from_rel).await?.content_length();
-    let reader = from.operator.reader(from_rel).await?;
-    let mut writer = open_writer(to, to_rel).await?;
-
-    let mut offset = 0u64;
-    while offset < len {
-        let end = (offset + CHUNK).min(len);
-        let step = async {
-            let buf = reader.read(offset..end).await?;
-            writer.write(buf).await
-        }
-        .await;
-
-        if let Err(e) = step {
-            let _ = writer.abort().await;
-            return Err(e);
-        }
-        offset = end;
-    }
-
-    writer.close().await.map(|_| ())
-}
-
 // ---------------------------------------------------------------------------
 // Access impl
 // ---------------------------------------------------------------------------
@@ -284,7 +234,7 @@ impl MountAccess {
                 meta.last_modified(Timestamp::from_second(0).unwrap());
                 Ok(meta.build())
             } else {
-                mount.stat(&rel).await
+                mount.operator.stat(&rel).await
             }
         } else if virtual_children(&self.mounts, path).is_some() {
             let mut meta = MetadataBuilder::dir();
@@ -337,9 +287,7 @@ impl Service for MountAccess {
                     ));
                 }
 
-                let res = mount.operator.create_dir(&rel).await;
-                mount.cache.invalidate(&rel).await;
-                res?;
+                mount.operator.create_dir(&rel).await?;
                 Ok(RpCreateDir::default())
             }
             None => Err(Error::new(ErrorKind::NotFound, "path not found")),
@@ -362,7 +310,7 @@ impl Service for MountAccess {
             return Err(Error::new(ErrorKind::NotFound, "path not found"));
         };
 
-        let rdr = MountReader::new(mount.clone(), rel);
+        let rdr = MountReader::new(mount.operator.clone(), rel);
         Ok(oio::PositionReader::new(rdr))
     }
 
@@ -381,7 +329,7 @@ impl Service for MountAccess {
                 "mount is read only",
             ));
         }
-        Ok(MountWriter::new(mount.clone(), rel))
+        Ok(MountWriter::new(mount.operator.clone(), rel))
     }
 
     fn delete(&self, _ctx: &OperationContext) -> Result<Self::Deleter> {
@@ -400,7 +348,7 @@ impl Service for MountAccess {
             debug!("LIST {path} to {}", &rel);
 
             return Ok(MountLister::Real {
-                mount: mount.clone(),
+                operator: mount.operator.clone(),
                 rel,
                 mount_path: mount_path.to_string(),
                 inner: None,
@@ -468,24 +416,24 @@ impl Service for MountAccess {
         // for it - plenty of services (e.g. `memory`) don't implement copy
         // at all and will return `Unsupported` if asked.
         let delegate = from_path == to_path && from_mount.operator.info().capability().copy;
-        let from_m = from_mount.clone();
-        let to_m = to_mount.clone();
+        let from_op = from_mount.operator.clone();
+        let to_op = to_mount.operator.clone();
 
         Ok(OneShotCopier::new_with(move || {
-            let from_m = from_m.clone();
-            let to_m = to_m.clone();
+            let from_op = from_op.clone();
+            let to_op = to_op.clone();
             let from_rel = from_rel.clone();
             let to_rel = to_rel.clone();
 
             async move {
                 if delegate {
-                    from_m.operator.copy(&from_rel, &to_rel).await?;
+                    from_op.copy(&from_rel, &to_rel).await?;
                 } else {
-                    stream_copy(&from_m, &from_rel, &to_m, &to_rel).await?;
+                    let data = from_op.read(&from_rel).await?;
+                    to_op.write(&to_rel, data).await?;
                 }
 
-                to_m.cache.invalidate(&to_rel).await;
-                to_m.stat(&to_rel).await
+                to_op.stat(&to_rel).await
             }
         }))
     }
@@ -524,28 +472,14 @@ impl Service for MountAccess {
                 ));
             }
 
-            let same_mount = from_path == to_path;
-            let cap = from_mount.operator.info().capability();
-
-            let res: Result<()> = async {
-                if same_mount && cap.rename {
-                    from_mount.operator.rename(&from_rel, &to_rel).await
-                } else if same_mount && cap.copy {
-                    // Object stores (B2, S3, ...) have no rename but do have
-                    // a server-side copy: copy + delete moves no bytes
-                    // through this process.
-                    from_mount.operator.copy(&from_rel, &to_rel).await?;
-                    from_mount.operator.delete(&from_rel).await
-                } else {
-                    stream_copy(from_mount, &from_rel, to_mount, &to_rel).await?;
-                    from_mount.operator.delete(&from_rel).await
-                }
+            let delegate = from_path == to_path && from_mount.operator.info().capability().rename;
+            if delegate {
+                from_mount.operator.rename(&from_rel, &to_rel).await?;
+            } else {
+                let data = from_mount.operator.read(&from_rel).await?;
+                to_mount.operator.write(&to_rel, data).await?;
+                from_mount.operator.delete(&from_rel).await?;
             }
-            .await;
-
-            from_mount.cache.invalidate(&from_rel).await;
-            to_mount.cache.invalidate(&to_rel).await;
-            res?;
 
             Ok(RpRename::default())
         }
