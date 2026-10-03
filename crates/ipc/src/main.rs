@@ -153,6 +153,28 @@ impl Args {
     }
 }
 
+/// Dependency log targets that are far too chatty at debug/trace.
+const NOISY_TARGETS: &[&str] = &[
+    "h2",
+    "hyper",
+    "hyper_util",
+    "tonic",
+    "tower",
+    "tracing",
+    "rustls",
+];
+
+/// True if `target` is one of [`NOISY_TARGETS`] or a submodule of it
+/// (`h2::codec::framed_write`, `tracing::span::active`, ...).
+fn is_noisy_target(target: &str) -> bool {
+    NOISY_TARGETS.iter().any(|p| {
+        target == *p
+            || target
+                .strip_prefix(p)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
+}
+
 struct ChannelLogger {
     logger: Box<dyn Log + Send + Sync>,
     tx: Sender<Data>,
@@ -168,12 +190,22 @@ impl Log for ChannelLogger {
             return;
         }
 
+        let ours = record.target().starts_with(env!("CARGO_CRATE_NAME"));
+
+        // The HTTP/2 stack and tracing's span bridge emit thousands of
+        // debug/trace lines per request. Keep only their warnings/errors in
+        // the terminal, the log file and the event stream. OpenDAL, reqwest
+        // and our own crate are unaffected.
+        if !ours && record.level() > log::Level::Info && is_noisy_target(record.target()) {
+            return;
+        }
+
         self.logger.log(record);
 
         // Forward our own crate at any level, but only warnings+ from
         // dependencies (hyper/h2/tonic debug logs would flood the event
         // queue, and every Poll would generate more of them).
-        let ours = record.target().starts_with(env!("CARGO_CRATE_NAME"));
+
         if !ours && record.level() > log::Level::Warn {
             return;
         }

@@ -18,7 +18,9 @@ impl oio::Delete for MountDeleter {
                     ));
                 }
 
-                mount.operator.delete(&rel).await
+                let res = mount.operator.delete(&rel).await;
+                mount.cache.invalidate(&rel).await;
+                res
             }
             None => Err(Error::new(ErrorKind::NotFound, "path not found")),
         }

@@ -1,12 +1,14 @@
 use futures_lite::StreamExt;
 use opendal_core::raw::oio;
-use opendal_core::{Lister, Operator};
+use opendal_core::Lister;
+
+use crate::layers::vfs::Mount;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 
 pub enum MountLister {
     Real {
-        operator: Operator,
+        mount: Mount,
         rel: String,
         mount_path: String,
         /// Lazily opened on the first call to `next`, since
@@ -40,13 +42,13 @@ impl oio::List for MountLister {
     async fn next(&mut self) -> opendal_core::Result<Option<oio::Entry>> {
         match self {
             MountLister::Real {
-                operator,
+                mount,
                 rel,
                 mount_path,
                 inner,
             } => {
                 if inner.is_none() {
-                    *inner = Some(operator.lister(rel).await?);
+                    *inner = Some(mount.operator.lister(rel).await?);
                 }
 
                 let lister = inner.as_mut().expect("just initialized above");
@@ -61,6 +63,16 @@ impl oio::List for MountLister {
                             let rel_trimmed = rel.trim_matches('/');
                             if entry_path == rel_trimmed {
                                 continue;
+                            }
+
+                            // File servers list a directory and then stat every
+                            // entry. For backends where list metadata == stat
+                            // metadata (B2) this turns N stat round trips into 0.
+                            if mount.cache.seeding() {
+                                mount
+                                    .cache
+                                    .seed(entry.path(), entry.metadata().clone())
+                                    .await;
                             }
 
                             let rebased = format!(

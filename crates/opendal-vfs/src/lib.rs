@@ -1,9 +1,15 @@
+mod cache;
 mod deleter;
 mod lister;
 mod reader;
 mod writer;
 
 pub mod layers;
+
+#[cfg(test)]
+mod cache_tests;
+
+pub use cache::{CacheConfig, MountCache};
 
 use std::collections::BTreeMap;
 

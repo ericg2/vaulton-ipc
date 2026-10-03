@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use opendal_layer_logging::LoggingLayer;
 use uuid::Uuid;
 
 pub type RepoNoIndex = Repository<OpenStatus>;
@@ -463,7 +464,8 @@ impl StorageManager {
             }
         }
 
-        Ok(op)
+        // Outermost, so calls rejected by the layers above are logged too.
+        Ok(op.layer(LoggingLayer::default()))
     }
 
     /// Builds the operator mounted into the user's VFS tree for a *data*
@@ -475,7 +477,8 @@ impl StorageManager {
         if !utils::is_user_writable(point) {
             op = op.layer(ReadOnlyLayer);
         }
-        Ok(op)
+        // Outermost, so calls rejected by the layers above are logged too.
+        Ok(op.layer(LoggingLayer::default()))
     }
 
     /// Builds one mount. Any failure here only affects this point.
@@ -486,15 +489,15 @@ impl StorageManager {
             match probe.list("") {
                 Ok(_) => {}
                 Err(e)
-                    if e.kind() == opendal_core::ErrorKind::NotFound
-                        && utils::is_local_scheme(&point.scheme) =>
-                {
-                    let root = utils::local_source_path(point)
-                        .map_err(|status| VfsError::Internal(status.to_string()))?;
-                    std::fs::create_dir_all(root).map_err(|e| {
-                        VfsError::Internal(format!("failed to create local point root: {e}"))
-                    })?;
-                }
+                if e.kind() == opendal_core::ErrorKind::NotFound
+                    && utils::is_local_scheme(&point.scheme) =>
+                    {
+                        let root = utils::local_source_path(point)
+                            .map_err(|status| VfsError::Internal(status.to_string()))?;
+                        std::fs::create_dir_all(root).map_err(|e| {
+                            VfsError::Internal(format!("failed to create local point root: {e}"))
+                        })?;
+                    }
                 Err(e) if e.kind() == opendal_core::ErrorKind::Unsupported => {
                     // Some backends do not implement root listing. A root stat
                     // is a cheaper fallback that still proves the backend is
@@ -647,8 +650,8 @@ impl StorageSystem for StorageManager {
             }
             result
         })
-        .await
-        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+            .await
+            .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
     }
 
     async fn get_repo_job(
@@ -664,8 +667,8 @@ impl StorageSystem for StorageManager {
         tokio::task::spawn_blocking(move || {
             this.create_for_job(&src, operator, job_id, tx, allow_init)
         })
-        .await
-        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+            .await
+            .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
     }
 
     async fn get_vfs(&self, user: &VfsUser) -> VfsResult<Operator> {
@@ -737,8 +740,8 @@ impl StorageSystem for StorageManager {
             }
             Ok(op)
         })
-        .await
-        .map_err(|e| VfsError::Internal(format!("spawn_blocking panicked: {e}")))?
+            .await
+            .map_err(|e| VfsError::Internal(format!("spawn_blocking panicked: {e}")))?
     }
 
     fn invalidate_vfs(&self, user: &VfsUser) {
@@ -800,8 +803,8 @@ impl StorageSystem for StorageManager {
         tokio::task::spawn_blocking(move || {
             this.add_repo_key_blocking(&old, &new_password, allow_write)
         })
-        .await
-        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+            .await
+            .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
     }
 
     async fn remove_old_repo_key(
@@ -816,8 +819,8 @@ impl StorageSystem for StorageManager {
         tokio::task::spawn_blocking(move || {
             this.remove_old_repo_key_blocking(&old, &new_password, allow_write)
         })
-        .await
-        .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
+            .await
+            .map_err(|e| RusticError::with_source(ErrorKind::Backend, "spawn_blocking panicked", e))?
     }
 }
 

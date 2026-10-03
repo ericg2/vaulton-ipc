@@ -710,13 +710,21 @@ impl Service for QuotaAccessor {
         let accessor = self.inner.clone();
         let ctx = ctx.clone();
         let path = path.to_string();
-        // Write to a staging path, not `path` itself, so a rejected or
-        // aborted write never touches (e.g. truncates) the real object.
-        let tmp_path = tmp_path_for(&path);
+        // Backends with a native `rename` (fs, ...) mutate the destination as
+        // soon as a write opens, so write to a staging path and rename on
+        // success. Object stores (B2, S3, ...) have no rename - and don't
+        // need staging, since an object only becomes visible when the upload
+        // completes - so they write straight to `path`.
+        let staged = self.inner.capability().rename;
+        let tmp_path = if staged {
+            tmp_path_for(&path)
+        } else {
+            path.clone()
+        };
 
-        self.inner
-            .write(&ctx, &tmp_path, args)
-            .map(|w| QuotaWriter::new(w, state, id, limit, accessor, ctx, path, tmp_path))
+        self.inner.write(&ctx, &tmp_path, args).map(|w| {
+            QuotaWriter::new(w, state, id, limit, accessor, ctx, path, tmp_path, staged)
+        })
     }
 
     fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
@@ -746,7 +754,14 @@ impl Service for QuotaAccessor {
         // Copy into a staging path, not `to` itself, so a rejected or
         // aborted copy never touches (e.g. partially overwrites) the real
         // destination object.
-        let tmp_to = tmp_path_for(to);
+        // (Only possible when the backend can rename the staged copy into
+        // place; object stores copy straight to `to`.)
+        let staged = self.inner.capability().rename;
+        let tmp_to = if staged {
+            tmp_path_for(to)
+        } else {
+            to.to_string()
+        };
         let inner = self.inner.copy(ctx, from, &tmp_to, args)?;
 
         Ok(QuotaCopier {
@@ -759,6 +774,8 @@ impl Service for QuotaAccessor {
             from: from.to_string(),
             to: to.to_string(),
             tmp_to,
+            staged,
+            to_size: None,
         })
     }
 
@@ -810,9 +827,19 @@ pub struct QuotaWriter<W> {
     tmp_path: String,
     /// Bytes written so far in this (not-yet-committed) write.
     written: u64,
+    /// True if `tmp_path` is a separate staging object that is renamed into
+    /// place on success; false if the write goes directly to `path`.
+    staged: bool,
+    /// Size of whatever sits at `path` before this write replaces it,
+    /// measured once, before any bytes are uploaded.
+    old_size: Option<u64>,
+    /// Set once the writer has been aborted or has failed the quota check,
+    /// so a later `abort()`/`close()` from the caller is not applied twice.
+    finished: bool,
 }
 
 impl<W> QuotaWriter<W> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         inner: W,
         state: QuotaState,
@@ -822,6 +849,7 @@ impl<W> QuotaWriter<W> {
         ctx: OperationContext,
         path: String,
         tmp_path: String,
+        staged: bool,
     ) -> Self {
         Self {
             inner,
@@ -833,6 +861,34 @@ impl<W> QuotaWriter<W> {
             path,
             tmp_path,
             written: 0,
+            staged,
+            old_size: None,
+            finished: false,
+        }
+    }
+
+    async fn old_size(&mut self) -> u64 {
+        if let Some(n) = self.old_size {
+            return n;
+        }
+        let n = size_of(&self.accessor, &self.ctx, &self.path).await;
+        self.old_size = Some(n);
+        n
+    }
+
+    /// Remove the output object after a *failed commit*: the staging object,
+    /// or (direct writes, where `tmp_path == path`) the object that was just
+    /// published and must not stay behind over quota.
+    async fn discard_output(&self) {
+        best_effort_remove(&self.accessor, &self.ctx, &self.tmp_path).await;
+    }
+
+    /// Clean up after an *aborted* write. Only a staging object exists to
+    /// remove: a direct write that never closed has published nothing, and
+    /// the existing object at `path` must be left alone.
+    async fn discard_staging(&self) {
+        if self.staged {
+            best_effort_remove(&self.accessor, &self.ctx, &self.tmp_path).await;
         }
     }
 }
@@ -849,46 +905,78 @@ impl<W> Debug for QuotaWriter<W> {
 
 impl<W: oio::Write> oio::Write for QuotaWriter<W> {
     async fn write(&mut self, bs: Buffer) -> Result<()> {
-        // Streams into the staging path - `self.path` is never touched
-        // here.
+        if self.finished {
+            return Err(Error::new(ErrorKind::Unexpected, "writer already aborted"));
+        }
+
         let len = bs.len() as u64;
+        let old_size = self.old_size().await;
+
+        // Fail fast: reject as soon as the bytes written so far can no
+        // longer fit, instead of uploading a whole oversized file and only
+        // then discovering it at `close()`. This is a cheap read of the
+        // current total; the atomic commit in `close()` remains the
+        // authoritative check.
+        let projected = self.written.saturating_add(len);
+        let current = self.state.current_bytes(&self.id).await?;
+        let would_be = current.saturating_sub(old_size).saturating_add(projected);
+        if would_be > self.limit {
+            let err = quota_exceeded_error(&self.id, current, would_be, self.limit);
+            let _ = self.inner.abort().await;
+            self.discard_staging().await;
+            self.written = 0;
+            self.finished = true;
+            return Err(err);
+        }
+
         self.inner.write(bs).await?;
         self.written += len;
         Ok(())
     }
 
     async fn close(&mut self) -> Result<Metadata> {
-        // Finalize the staged object. `self.path` is still whatever it
-        // was before this write started.
-        let meta = self.inner.close().await?;
-        let old_size = size_of(&self.accessor, &self.ctx, &self.path).await;
+        if self.finished {
+            return Err(Error::new(ErrorKind::Unexpected, "writer already aborted"));
+        }
 
-        // Sole enforcement point. Also where this id's bucket gets lazily
-        // loaded, if this is its first touch.
+        // Measure what we are replacing *before* the upload finalizes: for
+        // direct (unstaged) writes `path` is overwritten by `close()`.
+        let old_size = self.old_size().await;
+
+        let meta = self.inner.close().await?;
+
+        // Sole authoritative enforcement point. Also where this id's bucket
+        // gets lazily loaded, if this is its first touch.
         if let Err(err) = self
             .state
             .commit_write(&self.id, self.limit, old_size, self.written)
             .await
         {
-            best_effort_remove(&self.accessor, &self.ctx, &self.tmp_path).await;
+            // Staged: the real object is untouched. Direct: the new object
+            // has just been published (only reachable if another writer
+            // consumed the remaining quota during this upload), so remove it.
+            self.discard_output().await;
             self.written = 0;
             return Err(err);
         }
 
-        // Commit accepted: move the finished write into place.
-        if let Err(err) = commit_rename(&self.accessor, &self.ctx, &self.tmp_path, &self.path).await
-        {
-            // Roll back the quota commit so a failed rename doesn't leave
-            // the counter permanently overstated. u64::MAX as the limit
-            // here means "always allowed" - this is strictly undoing the
-            // delta we just applied, not a fresh request that could fail.
-            let _ = self
-                .state
-                .commit_write(&self.id, u64::MAX, self.written, old_size)
-                .await;
-            best_effort_remove(&self.accessor, &self.ctx, &self.tmp_path).await;
-            self.written = 0;
-            return Err(err);
+        if self.staged {
+            // Commit accepted: move the finished write into place.
+            if let Err(err) =
+                commit_rename(&self.accessor, &self.ctx, &self.tmp_path, &self.path).await
+            {
+                // Roll back the quota commit so a failed rename doesn't leave
+                // the counter permanently overstated. u64::MAX as the limit
+                // here means "always allowed" - this is strictly undoing the
+                // delta we just applied, not a fresh request that could fail.
+                let _ = self
+                    .state
+                    .commit_write(&self.id, u64::MAX, self.written, old_size)
+                    .await;
+                self.discard_output().await;
+                self.written = 0;
+                return Err(err);
+            }
         }
 
         self.written = 0;
@@ -896,13 +984,19 @@ impl<W: oio::Write> oio::Write for QuotaWriter<W> {
     }
 
     async fn abort(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+
         // Nothing was ever committed to the counter mid-write (accounting
-        // only happens at close), and the real `path` was never touched -
-        // only the staging path needs cleaning up.
-        self.inner.abort().await?;
-        best_effort_remove(&self.accessor, &self.ctx, &self.tmp_path).await;
+        // only happens at close). Staged writes never touched the real
+        // `path`; direct writes on object stores publish nothing until
+        // `close()`. Either way only the output object needs cleaning up.
+        let res = self.inner.abort().await;
+        self.discard_staging().await;
         self.written = 0;
-        Ok(())
+        res
     }
 }
 
@@ -976,6 +1070,21 @@ pub struct QuotaCopier<C> {
     from: String,
     to: String,
     tmp_to: String,
+    /// See [`QuotaWriter`]: true if `tmp_to` is a separate staging object.
+    staged: bool,
+    /// Size of the destination before the copy replaces it.
+    to_size: Option<u64>,
+}
+
+impl<C> QuotaCopier<C> {
+    async fn to_size(&mut self) -> u64 {
+        if let Some(n) = self.to_size {
+            return n;
+        }
+        let n = size_of(&self.accessor, &self.ctx, &self.to).await;
+        self.to_size = Some(n);
+        n
+    }
 }
 
 impl<C> Debug for QuotaCopier<C> {
@@ -990,15 +1099,18 @@ impl<C> Debug for QuotaCopier<C> {
 
 impl<C: oio::Copy> oio::Copy for QuotaCopier<C> {
     async fn next(&mut self) -> Result<Option<usize>> {
+        // Capture the destination's size before any bytes land (direct
+        // copies overwrite `to` as they run).
+        let _ = self.to_size().await;
         self.inner.next().await
     }
 
     async fn close(&mut self) -> Result<Metadata> {
         // Finalize the staged copy. `self.to` is still whatever it was
         // before this copy started.
+        let to_size = self.to_size().await;
         let meta = self.inner.close().await?;
         let from_size = size_of(&self.accessor, &self.ctx, &self.from).await;
-        let to_size = size_of(&self.accessor, &self.ctx, &self.to).await;
 
         // Copying is accounted like a write of `from_size` bytes that
         // replaces whatever currently sits at `to` (if anything).
@@ -1011,15 +1123,19 @@ impl<C: oio::Copy> oio::Copy for QuotaCopier<C> {
             return Err(err);
         }
 
-        // Commit accepted: move the finished copy into place.
-        if let Err(err) = commit_rename(&self.accessor, &self.ctx, &self.tmp_to, &self.to).await {
-            // Roll back the quota commit, same reasoning as QuotaWriter.
-            let _ = self
-                .state
-                .commit_write(&self.id, u64::MAX, from_size, to_size)
-                .await;
-            best_effort_remove(&self.accessor, &self.ctx, &self.tmp_to).await;
-            return Err(err);
+        // Commit accepted: move the finished copy into place (staged only).
+        if self.staged {
+            if let Err(err) =
+                commit_rename(&self.accessor, &self.ctx, &self.tmp_to, &self.to).await
+            {
+                // Roll back the quota commit, same reasoning as QuotaWriter.
+                let _ = self
+                    .state
+                    .commit_write(&self.id, u64::MAX, from_size, to_size)
+                    .await;
+                best_effort_remove(&self.accessor, &self.ctx, &self.tmp_to).await;
+                return Err(err);
+            }
         }
 
         Ok(meta)
@@ -1027,9 +1143,11 @@ impl<C: oio::Copy> oio::Copy for QuotaCopier<C> {
 
     async fn abort(&mut self) -> Result<()> {
         self.inner.abort().await?;
-        // The real `to` was never touched - only the staging path needs
-        // cleaning up.
-        best_effort_remove(&self.accessor, &self.ctx, &self.tmp_to).await;
+        // The real `to` was never touched - only a staging path (if any)
+        // needs cleaning up. Never delete `to` itself on abort.
+        if self.staged {
+            best_effort_remove(&self.accessor, &self.ctx, &self.tmp_to).await;
+        }
         Ok(())
     }
 }

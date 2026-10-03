@@ -28,6 +28,7 @@ bytes = "1.12"
 rustic_backend = { git = "https://github.com/ericg2/rustic_core.git" }
 rustic_core = { git = "https://github.com/ericg2/rustic_core.git" }
 opendal-vfs = { path = "../opendal-vfs" }
+opendal-layer-logging = "0.59"
 
 unftp-sbe-opendal = "0.4"
 libunftp = { version = "0.23.0", features = ["aws_lc_rs"] }
