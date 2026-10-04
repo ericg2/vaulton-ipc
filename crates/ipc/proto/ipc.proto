@@ -241,31 +241,6 @@ message ReadSnapshotArgs {
   uint64 length = 6;
 }
 
-
-enum SnapshotEntryKind {
-  SNAPSHOT_ENTRY_KIND_FILE = 0;
-  SNAPSHOT_ENTRY_KIND_DIRECTORY = 1;
-  SNAPSHOT_ENTRY_KIND_SYMLINK = 2;
-  // Devices, sockets, fifos.
-  SNAPSHOT_ENTRY_KIND_OTHER = 3;
-}
-
-// One file, directory or link inside a snapshot.
-message SnapshotEntry {
-  string name = 1;
-  // Absolute path inside the snapshot ("/" = snapshot root, "/" separators).
-  // Exactly the value RestoreArgs.snapshot_path and BrowseSnapshotArgs.path expect.
-  string path = 2;
-  SnapshotEntryKind kind = 3;
-  uint64 size = 4;
-  google.protobuf.Timestamp mtime = 5;
-  optional uint32 mode = 6;
-  string user = 7;
-  string group = 8;
-  // Set for symlinks.
-  string link_target = 9;
-}
-
 ///////////////////////////////////////////////////////////////////
 
 message JobFinishedEvent {
