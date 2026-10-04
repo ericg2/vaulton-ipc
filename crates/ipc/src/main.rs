@@ -26,6 +26,7 @@ pub mod ipc {
     tonic::include_proto!("ipc");
 }
 
+mod browse;
 mod core;
 mod db;
 mod event_bus;

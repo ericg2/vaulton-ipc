@@ -225,6 +225,84 @@ message GetSnapshotArgs {
   string repo_id = 2;
 }
 
+enum SnapshotEntryKind {
+  SNAPSHOT_ENTRY_KIND_FILE = 0;
+  SNAPSHOT_ENTRY_KIND_DIRECTORY = 1;
+  SNAPSHOT_ENTRY_KIND_SYMLINK = 2;
+  // Devices, sockets, fifos.
+  SNAPSHOT_ENTRY_KIND_OTHER = 3;
+}
+
+// One file, directory or link inside a snapshot.
+message SnapshotEntry {
+  string name = 1;
+  // Absolute path inside the snapshot ("/" = snapshot root, "/" separators).
+  // Exactly the value RestoreArgs.snapshot_path and BrowseSnapshotArgs.path expect.
+  string path = 2;
+  SnapshotEntryKind kind = 3;
+  uint64 size = 4;
+  google.protobuf.Timestamp mtime = 5;
+  optional uint32 mode = 6;
+  string user = 7;
+  string group = 8;
+  // Set for symlinks.
+  string link_target = 9;
+}
+
+// Lists a directory (or describes a single file) inside a snapshot. Read-only
+// and synchronous. Uses the shared cached repository handle and reads only the
+// trees along the requested path, never the whole snapshot.
+message BrowseSnapshotArgs {
+  string user = 1;
+  string repo_id = 2;
+  // A snapshot id, a unique id prefix, or "latest".
+  string snapshot_id = 3;
+  // Directory to list; empty or "/" = snapshot root. "." and empty segments are
+  // ignored, ".." is rejected.
+  string path = 4;
+  uint32 offset = 5;
+  // 0 = default (200); capped at 1000.
+  uint32 limit = 6;
+}
+
+// Reads one chunk of a regular file inside a snapshot (same shape as
+// ReadVfsArgs/ReadVfsResponse: callers read big files in chunks).
+message ReadSnapshotFileArgs {
+  string user = 1;
+  string repo_id = 2;
+  // A snapshot id, unique id prefix, or "latest". Callers that read several
+  // chunks should pass the full id returned by BrowseSnapshot.
+  string snapshot_id = 3;
+  // Path of a regular file inside the snapshot (never the root).
+  string path = 4;
+  uint64 offset = 5;
+  // 1..=32 MiB.
+  uint64 length = 6;
+}
+
+message ReadSnapshotFileResponse {
+  // Up to `length` bytes; shorter at the end of the file, empty past it.
+  bytes data = 1;
+  // Total size of the file in bytes.
+  uint64 size = 2;
+}
+
+message BrowseSnapshotResponse {
+  // Full id of the snapshot that was resolved.
+  string snapshot_id = 1;
+  // Canonical form of the requested path.
+  string path = 2;
+  // The requested node itself (the directory, or the file if `path` is a file).
+  SnapshotEntry node = 3;
+  // Children, directories first, then by name (case-insensitive). Empty for files.
+  repeated SnapshotEntry entries = 4;
+  // Number of children in the directory, regardless of paging.
+  uint32 total = 5;
+  uint32 offset = 6;
+  // The page size actually applied.
+  uint32 limit = 7;
+}
+
 ///////////////////////////////////////////////////////////////////
 
 message JobFinishedEvent {
@@ -434,6 +512,8 @@ service IpcService {
   rpc ApplyRetention(RetentionArgs) returns (JobStartResponse);
   rpc SetSnapshotLock(SetSnapshotLockArgs) returns (SetSnapshotLockResponse);
   rpc GetSnapshots(GetSnapshotArgs) returns (SnapshotResponse);
+  rpc BrowseSnapshot(BrowseSnapshotArgs) returns (BrowseSnapshotResponse);
+  rpc ReadSnapshotFile(ReadSnapshotFileArgs) returns (ReadSnapshotFileResponse);
   rpc CancelJob(CancelArgs) returns (JobCancelResponse);
   rpc Poll(Empty) returns (PollResponse);
   rpc SetVfs(SetVfsArgs) returns (Empty);
