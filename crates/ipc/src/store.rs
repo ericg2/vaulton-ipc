@@ -545,12 +545,14 @@ impl StorageManager {
         let config = OpenDALConfig::default()
             .scheme(point.scheme.clone())
             .options(point.config.clone().into_iter().collect::<HashMap<_, _>>());
+
         let op = Operator::from_config(RusticVfsConfig {
             options: RepositoryOptions::default(),
             backend: BackendOptions::default().with_repo(&config),
             credentials: Some(Credentials::password(&pass)),
             refresh_interval: Some(Duration::from_mins(2)),
         })?;
+        
         self.repo_vfs_ops.insert(src, op.clone());
         Ok((utils::repo_mount_path(&point.name), op))
     }

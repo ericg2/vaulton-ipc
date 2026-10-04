@@ -69,30 +69,6 @@ pub fn sort_nodes(nodes: &mut [Node]) {
     });
 }
 
-/// Converts a node into its API form; `path` is the node's own path.
-pub fn to_entry(node: &Node, path: String) -> SnapshotEntry {
-    let (kind, link_target) = match &node.node_type {
-        NodeType::File => (SnapshotEntryKind::File, String::new()),
-        NodeType::Dir => (SnapshotEntryKind::Directory, String::new()),
-        NodeType::Symlink { .. } => (
-            SnapshotEntryKind::Symlink,
-            node.node_type.to_link().to_string_lossy().into_owned(),
-        ),
-        _ => (SnapshotEntryKind::Other, String::new()),
-    };
-    SnapshotEntry {
-        name: node_name(node),
-        path,
-        kind: kind as i32,
-        size: if node.is_file() { node.meta.size } else { 0 },
-        mtime: node.meta.mtime.and_then(proto_stamp),
-        mode: node.meta.mode,
-        user: node.meta.user.clone().unwrap_or_default(),
-        group: node.meta.group.clone().unwrap_or_default(),
-        link_target,
-    }
-}
-
 /// The synthetic entry for the snapshot root, which has no node of its own.
 pub fn root_entry() -> SnapshotEntry {
     SnapshotEntry {

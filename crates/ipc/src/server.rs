@@ -21,71 +21,30 @@ use tokio::sync::Mutex as TokioMutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+
 use crate::core::{PointHealth, UserSystem, VfsPoint, VfsUser};
 use crate::event_bus::{is_critical, send as send_event};
 use crate::ipc::file_path::Path;
 use crate::ipc::ipc_event::Data;
 use crate::ipc::ipc_service_server::IpcService as IpcServiceTrait;
 use crate::ipc::vfs_point::Src as ProtoSrc;
-use crate::ipc::{
-    BackupArgs, CancelArgs, CheckArgs, CloseHandleArgs, Empty, ExistsResponse, FilePath,
-    BrowseSnapshotArgs, BrowseSnapshotResponse, ForgetArgs, GetJobArgs, GetSnapshotArgs, InfoResponse, IpcEvent, JobCancelResponse,
-    JobFinishedEvent, JobNewMessageEvent, JobStartResponse, JobState, JobStatusResponse,
-    ListVfsResponse, OpenWriteArgs, OpenWriteResponse, PointSource as ProtoPoint, PollResponse,
-    Priority, ReadVfsArgs, ReadVfsResponse, ReloadArgs, RepoSource as ProtoRepo, RestoreArgs,
-    ReadSnapshotFileArgs, ReadSnapshotFileResponse, RetentionArgs, SetLengthArgs, SetSnapshotLockArgs, SetSnapshotLockResponse, SetVfsArgs,
-    Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs, VfsNode,
-    VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteAtArgs,
-};
-use crate::browse;
+use crate::ipc::{BackupArgs, CancelArgs, CheckArgs, CloseHandleArgs, Empty, ExistsResponse, FilePath, ForgetArgs, GetJobArgs, GetSnapshotArgs, InfoResponse, IpcEvent, JobCancelResponse, JobFinishedEvent, JobNewMessageEvent, JobStartResponse, JobState, JobStatusResponse, ListSnapshotArgs, ListSnapshotResponse, ListVfsResponse, OpenWriteArgs, OpenWriteResponse, PointSource as ProtoPoint, PollResponse, Priority, ReadSnapshotArgs, ReadVfsArgs, ReadVfsResponse, ReloadArgs, RepoSource as ProtoRepo, RestoreArgs, RetentionArgs, SetLengthArgs, SetSnapshotLockArgs, SetSnapshotLockResponse, SetVfsArgs, Snapshot, SnapshotEntry, SnapshotEntryKind, StatResponse, Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteAtArgs};
 use crate::progress::RusticProgressBars;
 use crate::retention;
 use crate::store::{RepoIndexed, RepoSource, StorageSystem};
 use crate::utils;
-use crate::utils::{fix_path, map_dal, map_vfs};
+use crate::utils::{fix_path, map_dal, map_vfs, proto_stamp};
 use moka::sync::Cache;
 use opendal_vfs::layers::quota::{QuotaState, QuotaTracker};
 use rustic_core::jiff::Zoned;
 use rustic_core::repofile::{DeleteOption, Node, SnapshotFile, SnapshotId, SnapshotSummary};
 use rustic_core::{
-    CancelToken, CheckOptions, ErrorKind, LsOptions, PathList, ProgressBars, ProgressType,
-    RestoreOptions, RusticError, SnapshotOptions, StringList, TreeId,
+    CancelToken, CheckOptions, ErrorKind, LsOptions, NodeType, PathList, ProgressBars,
+    ProgressType, RestoreOptions, RusticError, SnapshotOptions, StringList, TreeId,
 };
 
-/// Resolves `comps` below the tree `root`, one component at a time, so a missing
-/// name and a non-directory in the middle get distinct, precise errors.
-/// `None` means the root itself (no components).
-fn find_node(repo: &RepoIndexed, root: TreeId, comps: &[String]) -> Result<Option<Node>, Status> {
-    let mut tree_id = root;
-    let mut target: Option<Node> = None;
-    for (i, comp) in comps.iter().enumerate() {
-        let tree = repo
-            .get_tree(&tree_id)
-            .map_err(|e| Status::internal(format!("reading the snapshot tree failed: {e}")))?;
-        let found = tree
-            .nodes
-            .into_iter()
-            .find(|n| n.name().to_string_lossy().as_ref() == comp.as_str())
-            .ok_or_else(|| {
-                Status::not_found(format!(
-                    "'{}' does not exist in this snapshot",
-                    browse::join(&comps[..=i])
-                ))
-            })?;
-        if i + 1 < comps.len() {
-            match (found.is_dir(), found.subtree) {
-                (true, Some(next)) => tree_id = next,
-                _ => {
-                    return Err(Status::failed_precondition(format!(
-                        "'{}' is not a directory",
-                        browse::join(&comps[..=i])
-                    )));
-                }
-            }
-        }
-        target = Some(found);
-    }
-    Ok(target)
+fn snapshot_not_found(spec: &str, e: impl std::fmt::Display) -> Status {
+    Status::not_found(format!("'{spec}' not found in repository: {e}"))
 }
 
 // ── Write handles ──────────────────────────────────────────────────────
@@ -549,6 +508,25 @@ fn resolve_file_path(user: &VfsUser, path: &FilePath) -> Result<String, Status> 
     }
 }
 
+/// Converts a node into its API form; `path` is the node's own path.
+pub fn rustic_to_node(entry: &Node, path: String) -> VfsNode {
+    let name = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(&path)
+        .to_string();
+
+    VfsNode {
+        name,
+        is_dir: entry.node_type == NodeType::Dir,
+        bytes: entry.meta.size,
+        ctime: entry.meta.ctime.map(rustic_to_ts),
+        mtime: entry.meta.mtime.map(rustic_to_ts),
+        atime: entry.meta.atime.map(rustic_to_ts),
+    }
+}
+
 /// Convert an opendal directory entry to the proto node type.
 fn entry_to_node(entry: &opendal_core::Entry) -> VfsNode {
     let meta = entry.metadata();
@@ -578,6 +556,13 @@ fn chrono_to_ts(ts: opendal_core::raw::Timestamp) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: inner.as_second(),
         nanos: inner.subsec_nanosecond(),
+    }
+}
+
+fn rustic_to_ts(ts: rustic_core::jiff::Timestamp) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: ts.as_second(),
+        nanos: ts.subsec_nanosecond(),
     }
 }
 
@@ -2058,8 +2043,8 @@ where
 
         let storage = Arc::clone(&self.inner.storage);
         let src = repo_src.clone();
-        let outcome = tokio::task::spawn_blocking(
-            move || -> Result<(String, String, bool), Status> {
+        let outcome =
+            tokio::task::spawn_blocking(move || -> Result<(String, String, bool), Status> {
                 let handle = tokio::runtime::Handle::current();
                 // No job owns this handle, so its progress events go nowhere:
                 // dropping the receiver makes every send fail fast.
@@ -2069,9 +2054,8 @@ where
                 let repo = handle
                     .block_on(storage.get_repo_job(&src, repo_op, Uuid::new_v4(), tx, false))
                     .map_err(|e| Status::internal(format!("failed to open repository: {e}")))?;
-                let internal = |what: &str, e: Box<RusticError>| {
-                    Status::internal(format!("{what}: {e}"))
-                };
+                let internal =
+                    |what: &str, e: Box<RusticError>| Status::internal(format!("{what}: {e}"));
 
                 let snaps = repo
                     .get_all_snapshots()
@@ -2119,10 +2103,9 @@ where
                     .map_err(|e| internal("removing the original snapshot failed", e))?;
 
                 Ok((new_id.to_string(), old.id.to_string(), want_locked))
-            },
-        )
-        .await
-        .map_err(|e| Status::internal(format!("snapshot lock task failed: {e}")))??;
+            })
+            .await
+            .map_err(|e| Status::internal(format!("snapshot lock task failed: {e}")))??;
 
         self.inner.snapshot_cache.invalidate(&repo_src);
         let (snapshot_id, previous_snapshot_id, locked) = outcome;
@@ -2138,185 +2121,16 @@ where
         }))
     }
 
-    /// Lists one directory of a snapshot (or describes a single file), so
-    /// callers can navigate a snapshot and pick a path for restore without
-    /// knowing the layout in advance.
-    async fn browse_snapshot(
-        &self,
-        req: Request<BrowseSnapshotArgs>,
-    ) -> Result<Response<BrowseSnapshotResponse>, Status> {
-        let args = req.into_inner();
-        let user = self.get_user(&args.user).await?;
-
-        let repo_point = utils::require_repo_point_id(&user, &args.repo_id)?;
-        let repo_src = utils::repo_source(repo_point)?;
-
-        if args.snapshot_id.trim().is_empty() {
-            return Err(Status::invalid_argument("snapshot_id is required"));
-        }
-        let comps = browse::split_path(&args.path).map_err(Status::invalid_argument)?;
-        let canon = browse::join(&comps);
-        let offset = args.offset as usize;
-        let limit = browse::clamp_limit(args.limit);
-        let snapshot_ref = args.snapshot_id;
-
-        // The shared, cached handle (same one `get_snapshots` uses): no index
-        // load per request.
-        let repo = self
-            .inner
-            .storage
-            .get_repo(&repo_src)
-            .await
-            .map_err(|err| Status::internal(format!("failed to open repository: {err}")))?;
-
-        let response = tokio::task::spawn_blocking(
-            move || -> Result<BrowseSnapshotResponse, Status> {
-                let internal = |what: &str, e: Box<RusticError>| {
-                    Status::internal(format!("{what}: {e}"))
-                };
-
-                let snap = repo
-                    .get_snapshot_from_str(&snapshot_ref, |_| true)
-                    .map_err(|e| {
-                        Status::not_found(format!("snapshot '{snapshot_ref}' not found: {e}"))
-                    })?;
-
-                // Walk down from the snapshot root (None = the root itself).
-                let target = find_node(&repo, snap.tree, &comps)?;
-
-                let (node_entry, mut children) = match &target {
-                    None => (
-                        browse::root_entry(),
-                        repo.get_tree(&snap.tree)
-                            .map_err(|e| internal("reading the snapshot tree failed", e))?
-                            .nodes,
-                    ),
-                    Some(n) if n.is_dir() => {
-                        let kids = match n.subtree {
-                            Some(t) => repo
-                                .get_tree(&t)
-                                .map_err(|e| internal("reading the directory failed", e))?
-                                .nodes,
-                            None => Vec::new(),
-                        };
-                        (browse::to_entry(n, canon.clone()), kids)
-                    }
-                    Some(n) => (browse::to_entry(n, canon.clone()), Vec::new()),
-                };
-
-                let total = children.len();
-                browse::sort_nodes(&mut children);
-                let entries = children
-                    .iter()
-                    .skip(offset)
-                    .take(limit as usize)
-                    .map(|n| browse::to_entry(n, browse::child_path(&canon, &browse::node_name(n))))
-                    .collect();
-
-                Ok(BrowseSnapshotResponse {
-                    snapshot_id: snap.id.to_string(),
-                    path: canon,
-                    node: Some(node_entry),
-                    entries,
-                    total: u32::try_from(total).unwrap_or(u32::MAX),
-                    offset: u32::try_from(offset).unwrap_or(u32::MAX),
-                    limit,
-                })
-            },
-        )
-        .await
-        .map_err(|e| Status::internal(format!("snapshot browse task failed: {e}")))??;
-
-        Ok(Response::new(response))
-    }
-
-    /// Reads a chunk of a regular file inside a snapshot, so a client can
-    /// download it (and resume/seek) the same way it reads VFS files.
-    async fn read_snapshot_file(
-        &self,
-        req: Request<ReadSnapshotFileArgs>,
-    ) -> Result<Response<ReadSnapshotFileResponse>, Status> {
-        let args = req.into_inner();
-        let user = self.get_user(&args.user).await?;
-
-        let repo_point = utils::require_repo_point_id(&user, &args.repo_id)?;
-        let repo_src = utils::repo_source(repo_point)?;
-
-        if args.snapshot_id.trim().is_empty() {
-            return Err(Status::invalid_argument("snapshot_id is required"));
-        }
-        if args.length == 0 || args.length > MAX_READ {
-            return Err(Status::invalid_argument(format!(
-                "length must be between 1 and {MAX_READ} bytes; read in chunks"
-            )));
-        }
-        let comps = browse::split_path(&args.path).map_err(Status::invalid_argument)?;
-        if comps.is_empty() {
-            return Err(Status::invalid_argument("path must point to a file"));
-        }
-        let offset = args.offset;
-        let length = args.length;
-        let snapshot_ref = args.snapshot_id;
-
-        // Same cached handle as browse/get_snapshots.
-        let repo = self
-            .inner
-            .storage
-            .get_repo(&repo_src)
-            .await
-            .map_err(|err| Status::internal(format!("failed to open repository: {err}")))?;
-
-        let response = tokio::task::spawn_blocking(
-            move || -> Result<ReadSnapshotFileResponse, Status> {
-                let snap = repo
-                    .get_snapshot_from_str(&snapshot_ref, |_| true)
-                    .map_err(|e| {
-                        Status::not_found(format!("snapshot '{snapshot_ref}' not found: {e}"))
-                    })?;
-                let node = find_node(&repo, snap.tree, &comps)?
-                    .ok_or_else(|| Status::invalid_argument("path must point to a file"))?;
-                if !node.is_file() {
-                    return Err(Status::failed_precondition(format!(
-                        "'{}' is not a regular file",
-                        browse::join(&comps)
-                    )));
-                }
-
-                let size = node.meta.size;
-                if offset >= size {
-                    return Ok(ReadSnapshotFileResponse { data: Vec::new(), size });
-                }
-                let want = length.min(size - offset);
-                let (off, len) = match (usize::try_from(offset), usize::try_from(want)) {
-                    (Ok(o), Ok(l)) => (o, l),
-                    _ => return Err(Status::out_of_range("offset or length does not fit")),
-                };
-
-                let open = repo
-                    .open_file(&node)
-                    .map_err(|e| Status::internal(format!("opening the file failed: {e}")))?;
-                let data = repo
-                    .read_file_at(&open, off, len)
-                    .map_err(|e| Status::internal(format!("reading the file failed: {e}")))?;
-                Ok(ReadSnapshotFileResponse { data: data.to_vec(), size })
-            },
-        )
-        .await
-        .map_err(|e| Status::internal(format!("snapshot read task failed: {e}")))??;
-
-        Ok(Response::new(response))
-    }
-
-    async fn get_snapshots(
+    async fn snap_get_all(
         &self,
         req: Request<GetSnapshotArgs>,
-    ) -> Result<Response<SnapshotResponse>, Status> {
+    ) -> Result<Response<ListSnapshotResponse>, Status> {
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
         let repo_src = utils::repo_source(utils::require_repo_point_id(&user, &args.repo_id)?)?;
 
         if let Some(cached) = self.inner.snapshot_cache.get(&repo_src) {
-            return Ok(Response::new(SnapshotResponse {
+            return Ok(Response::new(ListSnapshotResponse {
                 output: cached.as_ref().clone(),
             }));
         }
@@ -2333,10 +2147,124 @@ where
             .map_err(|e| Status::internal(format!("snapshot listing task failed: {e}")))?
             .map_err(|err| Status::internal(format!("snapshot listing failed: {err}")))?;
         let output: Vec<Snapshot> = snaps.into_iter().map(Into::into).collect();
-        let cached = Arc::new(output.clone());
-        self.inner.snapshot_cache.insert(repo_src, cached);
+        self.inner
+            .snapshot_cache
+            .insert(repo_src, Arc::new(output.clone()));
 
-        Ok(Response::new(SnapshotResponse { output }))
+        Ok(Response::new(ListSnapshotResponse { output }))
+    }
+
+    /// Lists the direct children of a snapshot directory. The node is resolved
+    /// with the same `node_from_snapshot_path` call `Restore` uses.
+    async fn snap_list_dir(
+        &self,
+        req: Request<ListSnapshotArgs>,
+    ) -> Result<Response<ListVfsResponse>, Status> {
+        let args = req.into_inner();
+        let user = self.get_user(&args.user).await?;
+        let repo_src = utils::repo_source(utils::require_repo_point_id(&user, &args.repo_id)?)?;
+
+        if args.snapshot_id.trim().is_empty() {
+            return Err(Status::invalid_argument("snapshot_id is required"));
+        }
+
+        let repo = self
+            .inner
+            .storage
+            .get_repo(&repo_src)
+            .await
+            .map_err(|err| Status::internal(format!("failed to open repository: {err}")))?;
+
+        let snap_path = format!("{}:{}", &args.snapshot_id, &args.snapshot_path);
+        let nodes = tokio::task::spawn_blocking(move || -> Result<Vec<VfsNode>, Status> {
+            let node = repo
+                .node_from_snapshot_path(&snap_path, |_| true)
+                .map_err(|e| snapshot_not_found(&snap_path, e))?;
+            if !node.is_dir() {
+                return Err(Status::failed_precondition(format!(
+                    "'{snap_path}' is not a directory"
+                )));
+            }
+            let Some(tree_id) = node.subtree else {
+                return Ok(Vec::new());
+            };
+            let tree = repo
+                .get_tree(&tree_id)
+                .map_err(|e| Status::internal(format!("reading the directory failed: {e}")))?;
+
+            let mut nodes: Vec<VfsNode> = tree
+                .nodes
+                .iter()
+                .map(|n| rustic_to_node(n, n.name().to_string_lossy().into_owned()))
+                .collect();
+            nodes.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+            Ok(nodes)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("snapshot list task failed: {e}")))??;
+
+        Ok(Response::new(ListVfsResponse { nodes }))
+    }
+
+    /// Reads a chunk of a file inside a snapshot (`snapshot_id` = `"<snap>:<file path>"`).
+    async fn snap_read_file(
+        &self,
+        req: Request<ReadSnapshotArgs>,
+    ) -> Result<Response<ReadVfsResponse>, Status> {
+        let args = req.into_inner();
+        let user = self.get_user(&args.user).await?;
+        let repo_src = utils::repo_source(utils::require_repo_point_id(&user, &args.repo_id)?)?;
+
+        if args.snapshot_id.trim().is_empty() {
+            return Err(Status::invalid_argument("snapshot_id is required"));
+        }
+        if args.length == 0 || args.length > MAX_READ {
+            return Err(Status::invalid_argument(format!(
+                "length must be between 1 and {MAX_READ} bytes; read in chunks"
+            )));
+        }
+
+        let repo = self
+            .inner
+            .storage
+            .get_repo(&repo_src)
+            .await
+            .map_err(|err| Status::internal(format!("failed to open repository: {err}")))?;
+
+        let snap_path = format!("{}:{}", &args.snapshot_id, &args.snapshot_path);
+        let (spec, offset, length) = (snap_path, args.offset, args.length);
+        let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, Status> {
+            let node = repo
+                .node_from_snapshot_path(&spec, |_| true)
+                .map_err(|e| snapshot_not_found(&spec, e))?;
+            if !node.is_file() {
+                return Err(Status::failed_precondition(format!(
+                    "'{spec}' is not a regular file"
+                )));
+            }
+
+            let size = node.meta.size;
+            if offset >= size {
+                return Ok(Vec::new());
+            }
+            let want = length.min(size - offset);
+            let (off, len) = match (usize::try_from(offset), usize::try_from(want)) {
+                (Ok(o), Ok(l)) => (o, l),
+                _ => return Err(Status::out_of_range("offset or length does not fit")),
+            };
+
+            let open = repo
+                .open_file(&node)
+                .map_err(|e| Status::internal(format!("opening the file failed: {e}")))?;
+            let data = repo
+                .read_file_at(&open, off, len)
+                .map_err(|e| Status::internal(format!("reading the file failed: {e}")))?;
+            Ok(data.to_vec())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("snapshot read task failed: {e}")))??;
+
+        Ok(Response::new(ReadVfsResponse { data }))
     }
 
     // ── CancelJob ─────────────────────────────────────────────────────────────
