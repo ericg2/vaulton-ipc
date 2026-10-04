@@ -30,6 +30,7 @@ mod core;
 mod db;
 mod event_bus;
 mod progress;
+mod retention;
 mod server;
 mod store;
 mod utils;

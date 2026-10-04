@@ -33,17 +33,19 @@ use crate::ipc::{
     JobFinishedEvent, JobNewMessageEvent, JobStartResponse, JobState, JobStatusResponse,
     ListVfsResponse, OpenWriteArgs, OpenWriteResponse, PointSource as ProtoPoint, PollResponse,
     Priority, ReadVfsArgs, ReadVfsResponse, ReloadArgs, RepoSource as ProtoRepo, RestoreArgs,
-    SetLengthArgs, SetVfsArgs, Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs,
-    VfsNode, VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteAtArgs,
+    RetentionArgs, SetLengthArgs, SetSnapshotLockArgs, SetSnapshotLockResponse, SetVfsArgs,
+    Snapshot, SnapshotResponse, StatResponse, Summary, TransferArgs, VfsNode,
+    VfsPoint as ProtoVfsPoint, VfsUser as ProtoVfsUser, WriteAtArgs,
 };
 use crate::progress::RusticProgressBars;
+use crate::retention;
 use crate::store::{RepoSource, StorageSystem};
 use crate::utils;
 use crate::utils::{fix_path, map_dal, map_vfs};
 use moka::sync::Cache;
 use opendal_vfs::layers::quota::{QuotaState, QuotaTracker};
 use rustic_core::jiff::Zoned;
-use rustic_core::repofile::{SnapshotFile, SnapshotId, SnapshotSummary};
+use rustic_core::repofile::{DeleteOption, SnapshotFile, SnapshotId, SnapshotSummary};
 use rustic_core::{
     CancelToken, CheckOptions, ErrorKind, LsOptions, PathList, ProgressBars, ProgressType,
     RestoreOptions, RusticError, SnapshotOptions, StringList,
@@ -368,6 +370,7 @@ impl From<SnapshotFile> for Snapshot {
             tags: s.tags.iter().map(|t| t.to_string()).collect(),
             paths: s.paths.iter().map(|p| p.to_string()).collect(),
             app_version: s.program_version,
+            locked: matches!(s.delete, DeleteOption::Never),
         }
     }
 }
@@ -872,6 +875,8 @@ where
     /// optimization so callers do not need a new RPC or handle ID.
     read_handles: DashMap<String, Arc<ActiveReadHandle>>,
     local_point_locks: DashMap<Uuid, Arc<TokioMutex<()>>>,
+    /// Serializes snapshot lock/unlock per repository point (keyed by point id).
+    repo_op_locks: DashMap<Uuid, Arc<TokioMutex<()>>>,
     snapshot_cache: Cache<RepoSource, Arc<Vec<Snapshot>>>,
     /// Global event sink: logs, point status and every job's progress.
     tx: chan::Sender<Data>,
@@ -926,6 +931,7 @@ where
                 write_handles: DashMap::new(),
                 read_handles: DashMap::new(),
                 local_point_locks: DashMap::new(),
+                repo_op_locks: DashMap::new(),
                 snapshot_cache: Cache::builder()
                     .time_to_live(Duration::from_secs(5))
                     .max_capacity(128)
@@ -1605,18 +1611,85 @@ where
         let job_user = repo_user.username.clone();
         let snapshot_repo_src = repo_src.clone();
 
+        // Every snapshot is labelled with its data point. Retention groups
+        // snapshots by host + label + paths, so two data points that are both
+        // backed up from "/" stay separate series (and never thin each other
+        // out); the label also keeps rustic's parent lookup per data point.
+        let label = data_point.id.to_string();
+
+        // Retention applies to real backups only.
+        let retention_policy = if args.dry_run {
+            None
+        } else {
+            args.retention.filter(retention::has_rules)
+        };
+        let repo_max_bytes = repo_point.max_bytes;
+        let quota = self.inner.quota.clone();
+        let quota_key = utils::quota_id(&repo_user.username, &repo_point.id);
+
         let job_id = self.spawn_job(job_user, move |job_id, tx, token| {
             let handle = tokio::runtime::Handle::current();
             let tags = StringList::from_str(&tags.join(",")).map_err(|err| {
                 RusticError::with_source(ErrorKind::InvalidInput, "Failed to parse tags", err)
             })?;
-            let snap = SnapshotOptions::default().tags(vec![tags]).to_snapshot()?;
-            let repo =
-                handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx, true))?;
+            let snap = SnapshotOptions::default()
+                .tags(vec![tags])
+                .label(label)
+                .to_snapshot()?;
+
+            // Retention helpers. `open` hands out a fresh repository handle on
+            // every call: a handle's in-memory index is stale after a prune, so
+            // retention never shares one with the backup below.
+            let retention_token = token.clone();
+            let open = || {
+                handle.block_on(storage.get_repo_job(
+                    &repo_src,
+                    repo_op.clone(),
+                    job_id,
+                    tx.clone(),
+                    false,
+                ))
+            };
+            let used_bytes = || {
+                handle
+                    .block_on(quota.current_bytes(&quota_key))
+                    .map_err(|e| e.to_string())
+            };
+            let retention_run = retention::Retention {
+                job_id,
+                tx: &tx,
+                token: &retention_token,
+                open: &open,
+                max_bytes: repo_max_bytes,
+                used_bytes: &used_bytes,
+                dry_run: false,
+            };
+
+            // Make room first: only when the free space is below the policy's
+            // reserve (cheap check; a brand-new repository returns early).
+            if let Some(policy) = retention_policy.as_ref() {
+                if retention::has_space_rule(policy) {
+                    if let Err(e) = retention_run.run(policy, retention::Phase::SpaceOnly) {
+                        retention_run.say(
+                            Priority::Warning,
+                            format!("Could not make room before the backup: {e}"),
+                        );
+                    }
+                }
+            }
+
+            let repo = handle.block_on(storage.get_repo_job(
+                &repo_src,
+                repo_op.clone(),
+                job_id,
+                tx.clone(),
+                true,
+            ))?;
             let paths = PathList::from_string(&source_path)?;
 
             let saved = if let Some(path) = local_path {
                 let source = LocalSource::new(path);
+                repo.get_all_snapshots()?[0].
                 repo.backup(snap)
                     .add_multi(&source, paths.paths())
                     .with_token(token)
@@ -1635,6 +1708,30 @@ where
                     .with_token(token)
                     .run()?
             };
+
+            // The snapshot is safely stored. Whatever retention does from here on
+            // can only produce warnings; it must never fail this backup.
+            drop(repo);
+            if let Some(policy) = retention_policy.as_ref() {
+                match retention_run.run(policy, retention::Phase::Full) {
+                    Ok(report) => {
+                        if report.time_deleted + report.space_deleted > 0 {
+                            retention_run.say(
+                                Priority::Info,
+                                format!(
+                                    "Retention removed {} snapshot(s), reclaimed {}",
+                                    report.time_deleted + report.space_deleted,
+                                    retention::fmt_bytes(report.bytes_freed)
+                                ),
+                            );
+                        }
+                    }
+                    Err(e) => retention_run.say(
+                        Priority::Warning,
+                        format!("Retention failed after the backup succeeded: {e}"),
+                    ),
+                }
+            }
 
             Ok(Some(saved.id.to_string()))
         });
@@ -1769,17 +1866,240 @@ where
         let storage = Arc::clone(&self.inner.storage);
         let username = user.username.clone();
         let snapshot_repo_src = repo_src.clone();
+        let include_locked = args.include_locked;
 
         let job_id = self.spawn_job(username, move |job_id, tx, _token| {
             let handle = tokio::runtime::Handle::current();
             let repo =
                 handle.block_on(storage.get_repo_job(&repo_src, repo_op, job_id, tx, false))?;
+
+            // Authoritative lock check (the API pre-checks too, but a snapshot
+            // can be locked between queueing and running).
+            if !include_locked {
+                let locked: Vec<String> = repo
+                    .get_all_snapshots()?
+                    .into_iter()
+                    .filter(|s| matches!(s.delete, DeleteOption::Never) && snap_ids.contains(&s.id))
+                    .map(|s| s.id.to_string())
+                    .collect();
+                if !locked.is_empty() {
+                    return Err(RusticError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "refusing to delete locked snapshot(s): {}. Unlock them first.",
+                            locked.join(", ")
+                        ),
+                    ));
+                }
+            }
+
             repo.delete_snapshots(&snap_ids)?;
             Ok(None)
         });
 
         self.inner.snapshot_cache.invalidate(&snapshot_repo_src);
         Ok(Response::new(JobStartResponse { job_id }))
+    }
+
+    /// Applies a retention policy on demand (time rules, then FIFO space rule,
+    /// then prune), or previews it with `dry_run`.
+    async fn apply_retention(
+        &self,
+        req: Request<RetentionArgs>,
+    ) -> Result<Response<JobStartResponse>, Status> {
+        let args = req.into_inner();
+        let user = self.get_user(&args.user).await?;
+
+        let repo_point = utils::require_repo_point_id(&user, &args.repo_id)?;
+        utils::require_writable(repo_point)?;
+        let repo_src = utils::repo_source(repo_point)?;
+        let policy = args
+            .policy
+            .ok_or_else(|| Status::invalid_argument("a retention policy is required"))?;
+        retention::validate(&policy).map_err(Status::invalid_argument)?;
+        let repo_op = self
+            .inner
+            .storage
+            .get_data_operator(&user, repo_point)
+            .map_err(map_vfs)?;
+
+        let storage = Arc::clone(&self.inner.storage);
+        let quota = self.inner.quota.clone();
+        let quota_key = utils::quota_id(&user.username, &repo_point.id);
+        let repo_max_bytes = repo_point.max_bytes;
+        let dry_run = args.dry_run;
+        let username = user.username.clone();
+        let snapshot_repo_src = repo_src.clone();
+
+        let job_id = self.spawn_job(username, move |job_id, tx, token| {
+            let handle = tokio::runtime::Handle::current();
+            let open = || {
+                handle.block_on(storage.get_repo_job(
+                    &repo_src,
+                    repo_op.clone(),
+                    job_id,
+                    tx.clone(),
+                    false,
+                ))
+            };
+            let used_bytes = || {
+                handle
+                    .block_on(quota.current_bytes(&quota_key))
+                    .map_err(|e| e.to_string())
+            };
+            let run = retention::Retention {
+                job_id,
+                tx: &tx,
+                token: &token,
+                open: &open,
+                max_bytes: repo_max_bytes,
+                used_bytes: &used_bytes,
+                dry_run,
+            };
+
+            if retention::has_space_rule(&policy) && repo_max_bytes.is_none() {
+                run.say(
+                    Priority::Warning,
+                    "This repository has no quota, so the free-space rule is skipped",
+                );
+            }
+
+            let report = run.run(&policy, retention::Phase::Full)?;
+            run.say(
+                Priority::Info,
+                if dry_run {
+                    "Dry run finished; nothing was changed".to_string()
+                } else {
+                    format!(
+                        "Retention finished: {} snapshot(s) removed by time rules, {} by the space \
+                         rule, {} reclaimed",
+                        report.time_deleted,
+                        report.space_deleted,
+                        retention::fmt_bytes(report.bytes_freed)
+                    )
+                },
+            );
+            Ok(None)
+        });
+
+        self.inner.snapshot_cache.invalidate(&snapshot_repo_src);
+        Ok(Response::new(JobStartResponse { job_id }))
+    }
+
+    /// Locks or unlocks one snapshot via rustic's delete protection.
+    ///
+    /// The snapshot file is content-addressed, so changing it means writing a
+    /// modified copy and then removing the original; the copy has a new id.
+    /// The copy is written first: a crash in between leaves a duplicate, never
+    /// a lost snapshot.
+    async fn set_snapshot_lock(
+        &self,
+        req: Request<SetSnapshotLockArgs>,
+    ) -> Result<Response<SetSnapshotLockResponse>, Status> {
+        let args = req.into_inner();
+        let user = self.get_user(&args.user).await?;
+
+        let repo_point = utils::require_repo_point_id(&user, &args.repo_id)?;
+        utils::require_writable(repo_point)?;
+        let repo_src = utils::repo_source(repo_point)?;
+        let repo_op = self
+            .inner
+            .storage
+            .get_data_operator(&user, repo_point)
+            .map_err(map_vfs)?;
+        let wanted = SnapshotId::from_str(&args.snapshot_id).map_err(|e| {
+            Status::invalid_argument(format!("invalid snapshot id '{}': {e}", args.snapshot_id))
+        })?;
+        let want_locked = args.locked;
+
+        let op_lock = self
+            .inner
+            .repo_op_locks
+            .entry(repo_point.id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone();
+        let _guard = op_lock.lock().await;
+
+        let storage = Arc::clone(&self.inner.storage);
+        let src = repo_src.clone();
+        let outcome = tokio::task::spawn_blocking(
+            move || -> Result<(String, String, bool), Status> {
+                let handle = tokio::runtime::Handle::current();
+                // No job owns this handle, so its progress events go nowhere:
+                // dropping the receiver makes every send fail fast.
+                let (tx, rx) = chan::bounded::<Data>(1);
+                drop(rx);
+
+                let repo = handle
+                    .block_on(storage.get_repo_job(&src, repo_op, Uuid::new_v4(), tx, false))
+                    .map_err(|e| Status::internal(format!("failed to open repository: {e}")))?;
+                let internal = |what: &str, e: Box<RusticError>| {
+                    Status::internal(format!("{what}: {e}"))
+                };
+
+                let snaps = repo
+                    .get_all_snapshots()
+                    .map_err(|e| internal("snapshot listing failed", e))?;
+                let old = snaps
+                    .iter()
+                    .find(|s| s.id == wanted)
+                    .ok_or_else(|| Status::not_found("snapshot not found"))?;
+
+                let is_locked = matches!(old.delete, DeleteOption::Never);
+                if is_locked == want_locked {
+                    let id = old.id.to_string();
+                    return Ok((id.clone(), id, is_locked));
+                }
+
+                let mut modified = old.clone();
+                modified.delete = if want_locked {
+                    DeleteOption::Never
+                } else {
+                    DeleteOption::NotSet
+                };
+                repo.save_snapshots(vec![modified])
+                    .map_err(|e| internal("saving the snapshot failed", e))?;
+
+                // `save_snapshots` does not report the new id; find the copy.
+                let after = repo
+                    .get_all_snapshots()
+                    .map_err(|e| internal("snapshot listing failed", e))?;
+                let new_id = after
+                    .iter()
+                    .find(|s| {
+                        s.id != old.id
+                            && s.tree == old.tree
+                            && s.time == old.time
+                            && s.hostname == old.hostname
+                            && s.label == old.label
+                            && s.paths == old.paths
+                            && s.tags == old.tags
+                            && matches!(s.delete, DeleteOption::Never) == want_locked
+                    })
+                    .map(|s| s.id.clone())
+                    .ok_or_else(|| Status::internal("the updated snapshot could not be found"))?;
+
+                repo.delete_snapshots(&[old.id.clone()])
+                    .map_err(|e| internal("removing the original snapshot failed", e))?;
+
+                Ok((new_id.to_string(), old.id.to_string(), want_locked))
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(format!("snapshot lock task failed: {e}")))??;
+
+        self.inner.snapshot_cache.invalidate(&repo_src);
+        let (snapshot_id, previous_snapshot_id, locked) = outcome;
+        info!(
+            "snapshot {previous_snapshot_id} of repo '{}' {} (new id {snapshot_id})",
+            repo_point.name,
+            if locked { "locked" } else { "unlocked" }
+        );
+        Ok(Response::new(SetSnapshotLockResponse {
+            snapshot_id,
+            previous_snapshot_id,
+            locked,
+        }))
     }
 
     async fn get_snapshots(

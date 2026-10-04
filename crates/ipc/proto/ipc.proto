@@ -119,6 +119,33 @@ message Snapshot {
   repeated string tags = 4;
   repeated string paths = 5;
   string app_version = 6;
+  // True when the snapshot carries rustic's delete protection (DeleteOption::Never).
+  // Locked snapshots are never removed by retention (time- or space-based);
+  // Forget refuses them unless ForgetArgs.include_locked is set.
+  bool locked = 7;
+}
+
+// Retention rules for one repository. A zero value means "rule not used".
+//
+// Time-based rules use rustic's keep-* semantics and are applied per group of
+// snapshots (same host + label + paths, so every backed-up data point is its own
+// series). Space-based rules keep a part of the repository quota free by
+// deleting the OLDEST unlocked snapshots first (FIFO) and pruning; the newest
+// snapshot of every group and all locked snapshots are never touched by them.
+message RetentionPolicy {
+  uint32 keep_last = 1;
+  uint32 keep_hourly = 2;
+  uint32 keep_daily = 3;
+  uint32 keep_weekly = 4;
+  uint32 keep_monthly = 5;
+  uint32 keep_yearly = 6;
+  // Keep every snapshot younger than this many days (relative to the newest one).
+  uint32 keep_within_days = 7;
+  // Keep at least this many bytes of the repository quota free (0 = off).
+  uint64 reserve_bytes = 8;
+  // Keep at least this percentage of the repository quota free (0 = off, max 50).
+  // When both reserve fields are set the larger requirement wins.
+  uint32 reserve_percent = 9;
 }
 
 // Example: backup "/points/local/test/abcd" (a VFS path under one of the
@@ -130,6 +157,10 @@ message BackupArgs {
   bool dry_run = 4;
   optional DataFilter filter = 5;
   repeated string tags = 6;
+  // When set (and not a dry run), the job first makes room (space rules only),
+  // takes the backup, then applies the full policy. Retention problems are
+  // reported as job messages and never fail an otherwise successful backup.
+  RetentionPolicy retention = 7;
 }
 
 // Example: restore "/" from repo point "repo_name", snapshot "xyz", to VFS
@@ -153,6 +184,36 @@ message ForgetArgs {
   string user = 1;
   string repo_id = 2;
   repeated string snapshots = 3;
+  // Locked snapshots are refused unless this is set.
+  bool include_locked = 4;
+}
+
+// Applies a retention policy to a repository as a job (time rules, then FIFO
+// space rules, then prune). With dry_run nothing is changed; the job messages
+// list what would be deleted.
+message RetentionArgs {
+  string user = 1;
+  string repo_id = 2;
+  RetentionPolicy policy = 3;
+  bool dry_run = 4;
+}
+
+// Locks (delete-protects) or unlocks one snapshot.
+// A snapshot file cannot be edited in place, so the backend writes a modified
+// copy and removes the original: the snapshot gets a NEW id (see response).
+message SetSnapshotLockArgs {
+  string user = 1;
+  string repo_id = 2;
+  string snapshot_id = 3;
+  bool locked = 4;
+}
+
+message SetSnapshotLockResponse {
+  // Id of the snapshot after the change (equal to previous_snapshot_id when it
+  // was already in the requested state).
+  string snapshot_id = 1;
+  string previous_snapshot_id = 2;
+  bool locked = 3;
 }
 
 message CancelArgs {
@@ -370,6 +431,8 @@ service IpcService {
   rpc Restore(RestoreArgs) returns (JobStartResponse);
   rpc Check(CheckArgs) returns (JobStartResponse);
   rpc Forget(ForgetArgs) returns (JobStartResponse);
+  rpc ApplyRetention(RetentionArgs) returns (JobStartResponse);
+  rpc SetSnapshotLock(SetSnapshotLockArgs) returns (SetSnapshotLockResponse);
   rpc GetSnapshots(GetSnapshotArgs) returns (SnapshotResponse);
   rpc CancelJob(CancelArgs) returns (JobCancelResponse);
   rpc Poll(Empty) returns (PollResponse);
