@@ -31,11 +31,11 @@ use crate::ipc::{
     BackupArgs, CancelArgs, CheckArgs, CloseHandleArgs, Empty, ExistsResponse, FilePath,
     ForgetArgs, GetJobArgs, GetSnapshotArgs, InfoResponse, IpcEvent, JobCancelResponse,
     JobFinishedEvent, JobNewMessageEvent, JobStartResponse, JobState, JobStatusResponse,
-    ListSnapshotArgs, ListSnapshotResponse, ListVfsResponse, OpenWriteArgs, OpenWriteResponse,
+    ListSnapshotResponse, ListVfsResponse, OpenWriteArgs, OpenWriteResponse,
     PointSource as ProtoPoint, PollResponse, Priority, ReadSnapshotArgs, ReadVfsArgs,
     ReadVfsResponse, ReloadArgs, RepoSource as ProtoRepo, RestoreArgs, RetentionArgs,
     SetLengthArgs, SetSnapshotLockArgs, SetSnapshotLockResponse, SetVfsArgs, Snapshot,
-    StatResponse, Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint,
+    SnapshotPath, StatResponse, Summary, TransferArgs, VfsNode, VfsPoint as ProtoVfsPoint,
     VfsUser as ProtoVfsUser, WriteAtArgs,
 };
 use crate::progress::RusticProgressBars;
@@ -2167,7 +2167,7 @@ where
     /// with the same `node_from_snapshot_path` call `Restore` uses.
     async fn snap_list_dir(
         &self,
-        req: Request<ListSnapshotArgs>,
+        req: Request<SnapshotPath>,
     ) -> Result<Response<ListVfsResponse>, Status> {
         let args = req.into_inner();
         let user = self.get_user(&args.user).await?;
@@ -2276,6 +2276,39 @@ where
         Ok(Response::new(ReadVfsResponse { data }))
     }
 
+    async fn snap_stat(
+        &self,
+        req: Request<SnapshotPath>,
+    ) -> Result<Response<StatResponse>, Status> {
+        let args = req.into_inner();
+        let user = self.get_user(&args.user).await?;
+        let repo_src = utils::repo_source(utils::require_repo_point_id(&user, &args.repo_id)?)?;
+
+        if args.snapshot_id.trim().is_empty() {
+            return Err(Status::invalid_argument("snapshot_id is required"));
+        }
+
+        let repo = self
+            .inner
+            .storage
+            .get_repo(&repo_src)
+            .await
+            .map_err(|err| Status::internal(format!("failed to open repository: {err}")))?;
+
+        let snap_path = format!("{}:{}", &args.snapshot_id, &args.snapshot_path);
+        let node = tokio::task::spawn_blocking(move || -> Result<VfsNode, Status> {
+            let node = repo
+                .node_from_snapshot_path(&snap_path, |_| true)
+                .map_err(|e| snapshot_not_found(&snap_path, e))?;
+
+            Ok(rustic_to_node(&node, node.name.clone()))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("snapshot list task failed: {e}")))??;
+
+        Ok(Response::new(StatResponse { node: Some(node) }))
+    }
+
     // ── CancelJob ─────────────────────────────────────────────────────────────
 
     async fn cancel_job(
@@ -2301,47 +2334,6 @@ where
     }
 
     // ── GetJob ────────────────────────────────────────────────────────────────
-
-    /// Returns the live state of a running job, or the recorded result of a
-    /// recently finished one. Lets synchronous callers (SMB) wait on jobs
-    /// without consuming the shared `Poll` event stream.
-    async fn get_job(
-        &self,
-        req: Request<GetJobArgs>,
-    ) -> Result<Response<JobStatusResponse>, Status> {
-        let args = req.into_inner();
-        let uuid = Uuid::parse_str(&args.job_id)
-            .map_err(|e| Status::invalid_argument(format!("bad job_id: {e}")))?;
-
-        // Running jobs first; `finish_job` records the result before removing
-        // the job, so one of the two lookups always hits.
-        if let Some(job) = self.inner.jobs.get(&uuid) {
-            return Ok(Response::new(JobStatusResponse {
-                state: JobState::Running as i32,
-                done_bytes: job.progress.done.load(Ordering::Relaxed),
-                total_bytes: job.progress.total.load(Ordering::Relaxed),
-                error: String::new(),
-            }));
-        }
-
-        if let Some(finished) = self.inner.finished_jobs.get(&uuid) {
-            return Ok(Response::new(JobStatusResponse {
-                state: if finished.success {
-                    JobState::Succeeded
-                } else {
-                    JobState::Failed
-                } as i32,
-                done_bytes: finished.done,
-                total_bytes: finished.total,
-                error: finished.error.clone(),
-            }));
-        }
-
-        Err(Status::not_found(format!(
-            "job '{}' not found (unknown or result expired)",
-            args.job_id
-        )))
-    }
 
     async fn poll(&self, _: Request<Empty>) -> Result<Response<PollResponse>, Status> {
         let mut events = self
@@ -2543,6 +2535,47 @@ where
             info.extend(self.user_info(user).await);
         }
         Ok(Response::new(InfoResponse { info }))
+    }
+
+    /// Returns the live state of a running job, or the recorded result of a
+    /// recently finished one. Lets synchronous callers (SMB) wait on jobs
+    /// without consuming the shared `Poll` event stream.
+    async fn get_job(
+        &self,
+        req: Request<GetJobArgs>,
+    ) -> Result<Response<JobStatusResponse>, Status> {
+        let args = req.into_inner();
+        let uuid = Uuid::parse_str(&args.job_id)
+            .map_err(|e| Status::invalid_argument(format!("bad job_id: {e}")))?;
+
+        // Running jobs first; `finish_job` records the result before removing
+        // the job, so one of the two lookups always hits.
+        if let Some(job) = self.inner.jobs.get(&uuid) {
+            return Ok(Response::new(JobStatusResponse {
+                state: JobState::Running as i32,
+                done_bytes: job.progress.done.load(Ordering::Relaxed),
+                total_bytes: job.progress.total.load(Ordering::Relaxed),
+                error: String::new(),
+            }));
+        }
+
+        if let Some(finished) = self.inner.finished_jobs.get(&uuid) {
+            return Ok(Response::new(JobStatusResponse {
+                state: if finished.success {
+                    JobState::Succeeded
+                } else {
+                    JobState::Failed
+                } as i32,
+                done_bytes: finished.done,
+                total_bytes: finished.total,
+                error: finished.error.clone(),
+            }));
+        }
+
+        Err(Status::not_found(format!(
+            "job '{}' not found (unknown or result expired)",
+            args.job_id
+        )))
     }
 
     async fn reload_vfs(&self, req: Request<ReloadArgs>) -> Result<Response<InfoResponse>, Status> {

@@ -225,7 +225,7 @@ message GetSnapshotArgs {
   string repo_id = 2;
 }
 
-message ListSnapshotArgs {
+message SnapshotPath {
   string user = 1;
   string repo_id = 2;
   string snapshot_id = 3;
@@ -450,8 +450,9 @@ service IpcService {
   rpc SetSnapshotLock(SetSnapshotLockArgs) returns (SetSnapshotLockResponse);
 
   rpc Snap_GetAll(GetSnapshotArgs) returns (ListSnapshotResponse);
-  rpc Snap_ListDir(ListSnapshotArgs) returns (ListVfsResponse);
+  rpc Snap_ListDir(SnapshotPath) returns (ListVfsResponse);
   rpc Snap_ReadFile(ReadSnapshotArgs) returns (ReadVfsResponse);
+  rpc Snap_Stat(SnapshotPath) returns (StatResponse);
 
   rpc CancelJob(CancelArgs) returns (JobCancelResponse);
   rpc Poll(Empty) returns (PollResponse);
