@@ -381,11 +381,11 @@ impl From<SnapshotFile> for Snapshot {
 }
 
 /// Validates stable point IDs and makes point names unique within each
-/// user's VFS namespace.
+/// user's mount namespace (`/points` or `/repos`).
 ///
-/// Point IDs are globally unique across the complete configuration. Names are
-/// only a presentation/mount concern, so a duplicate name is retained for the
-/// first point and later points receive a deterministic ID-based suffix.
+/// Point IDs are globally unique across the complete configuration. Data and
+/// repository names are scoped separately because they are mounted under
+/// different roots; only collisions within the same root need a suffix.
 fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
     // IDs live in one namespace shared by data and repo points, across all
     // users. Validate that first, up front, before touching names.
@@ -402,7 +402,7 @@ fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
             )));
         }
 
-        let mut names = HashSet::new();
+        let mut names: HashSet<(bool, String)> = HashSet::new();
 
         for point in &mut user.points {
             if point.name.is_empty() {
@@ -440,7 +440,8 @@ fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
             }
 
             let original_name = point.name.clone();
-            if names.insert(original_name.clone()) {
+            let namespace = point.is_repo;
+            if names.insert((namespace, original_name.clone())) {
                 continue;
             }
 
@@ -449,7 +450,7 @@ fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
 
             for prefix_len in [8usize, 12, 16, 20, 24, 32] {
                 let candidate = format!("{}-{}", original_name, &id_text[..prefix_len]);
-                if names.insert(candidate.clone()) {
+                if names.insert((namespace, candidate.clone())) {
                     assigned = Some(candidate);
                     break;
                 }
@@ -459,7 +460,7 @@ fn normalize_vfs_users(users: &mut [VfsUser]) -> Result<(), Status> {
                 let mut suffix = 2u64;
                 loop {
                     let candidate = format!("{original_name}-{id_text}-{suffix}");
-                    if names.insert(candidate.clone()) {
+                    if names.insert((namespace, candidate.clone())) {
                         assigned = Some(candidate);
                         break;
                     }
@@ -2976,7 +2977,6 @@ where
         // fall back to the directory form on NotFound before giving up.
         let (op, file_path) = self.get_operator(&args, false).await?;
 
-        error!("CALLING R-STAT FOR VFS");
         let meta = match op.stat(&file_path).await {
             Ok(meta) => meta,
             Err(e) if e.kind() == DalErrorKind::NotFound => {
